@@ -1,7 +1,7 @@
 {
   "name": "bixstudio-renderer",
-  "version": "1.2.0",
-  "description": "Servidor de renderizado 300 DPI para BixStudio",
+  "version": "2.0.0",
+  "description": "BixStudio API + renderer 300 DPI con Google Cloud Storage",
   "type": "module",
   "main": "server.js",
   "scripts": {
@@ -11,6 +11,7 @@
     "node": "24.x"
   },
   "dependencies": {
+    "@google-cloud/storage": "^7.17.3",
     "express": "^5.1.0",
     "sharp": "^0.34.3"
   }
