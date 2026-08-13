@@ -127,3 +127,5 @@ const PORT = Number(process.env.PORT) || 8080;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`BixStudio Renderer iniciado en puerto ${PORT}`);
 });
+
+// Cloud Run deployment test
