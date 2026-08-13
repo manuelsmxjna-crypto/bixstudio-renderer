@@ -8,13 +8,27 @@ const storage = new Storage();
 
 app.use(express.json({ limit: "5mb" }));
 
-const VERSION = "2.0.0";
+const VERSION = "2.1.0";
 const DPI = 300;
 const PX_PER_CM = DPI / 2.54;
 const BUCKET_NAME =
   process.env.BIXSTUDIO_BUCKET || "bixstudio-files-318403647962";
 
 const bucket = storage.bucket(BUCKET_NAME);
+
+const SUPABASE_URL = String(process.env.SUPABASE_URL || "").replace(/\/$/, "");
+const SUPABASE_SECRET_KEY = String(process.env.SUPABASE_SECRET_KEY || "");
+
+function getSupabaseRestRoot() {
+  if (!SUPABASE_URL) throw new Error("Falta SUPABASE_URL");
+  const url = new URL(SUPABASE_URL);
+
+  if (url.protocol !== "https:" || !url.hostname.endsWith(".supabase.co")) {
+    throw new Error("SUPABASE_URL no es una URL válida de Supabase");
+  }
+
+  return `${url.origin}/rest/v1/`;
+}
 
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -244,6 +258,44 @@ app.get("/", (req, res) => {
     version: VERSION,
     bucket: BUCKET_NAME
   });
+});
+
+app.get("/supabase-health", async (req, res) => {
+  const configured = Boolean(SUPABASE_URL && SUPABASE_SECRET_KEY);
+
+  if (!configured) {
+    return res.status(503).json({
+      ok: false,
+      supabaseConfigured: false,
+      databaseReachable: false,
+      error: "Faltan SUPABASE_URL o SUPABASE_SECRET_KEY en Cloud Run."
+    });
+  }
+
+  try {
+    const response = await fetch(getSupabaseRestRoot(), {
+      method: "GET",
+      headers: {
+        apikey: SUPABASE_SECRET_KEY,
+        Authorization: `Bearer ${SUPABASE_SECRET_KEY}`
+      },
+      signal: AbortSignal.timeout(10000)
+    });
+
+    return res.status(response.ok ? 200 : 502).json({
+      ok: response.ok,
+      supabaseConfigured: true,
+      databaseReachable: response.ok,
+      status: response.status
+    });
+  } catch (error) {
+    return res.status(502).json({
+      ok: false,
+      supabaseConfigured: true,
+      databaseReachable: false,
+      error: error?.message || String(error)
+    });
+  }
 });
 
 app.get("/health", async (req, res) => {
