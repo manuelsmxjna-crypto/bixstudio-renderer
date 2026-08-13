@@ -1,0 +1,17 @@
+{
+  "name": "bixstudio-renderer",
+  "version": "1.0.0",
+  "description": "Servidor de renderizado 300 DPI para BixStudio",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": "24.x"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "sharp": "^0.34.3"
+  }
+}
