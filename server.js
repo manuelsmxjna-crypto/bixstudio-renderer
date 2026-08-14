@@ -8,7 +8,7 @@ const storage = new Storage();
 
 app.use(express.json({ limit: "5mb" }));
 
-const VERSION = "2.3.0";
+const VERSION = "2.4.0";
 const DPI = 300;
 const PX_PER_CM = DPI / 2.54;
 const BUCKET_NAME =
@@ -28,6 +28,157 @@ function getSupabaseRestRoot() {
   }
 
   return `${url.origin}/rest/v1/`;
+}
+
+function isUuid(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    String(value || "")
+  );
+}
+
+async function supabaseRequest(path, {
+  method = "GET",
+  body,
+  prefer,
+  timeoutMs = 10000
+} = {}) {
+  if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
+    throw new Error("Supabase no está configurado en Cloud Run.");
+  }
+
+  const headers = {
+    apikey: SUPABASE_SECRET_KEY,
+    Accept: "application/json"
+  };
+
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  if (prefer) headers.Prefer = prefer;
+
+  const response = await fetch(`${getSupabaseRestRoot()}${path}`, {
+    method,
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+    signal: AbortSignal.timeout(timeoutMs)
+  });
+
+  const text = await response.text();
+  let data = null;
+
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch (_) {
+      data = text;
+    }
+  }
+
+  if (!response.ok) {
+    const err = new Error(
+      data?.message ||
+      data?.error ||
+      data?.hint ||
+      `Supabase respondió HTTP ${response.status}`
+    );
+    err.status = response.status;
+    err.details = data;
+    throw err;
+  }
+
+  return data;
+}
+
+async function ensureSheetRecord({
+  projectId,
+  sheetNumber,
+  widthCm,
+  heightCm,
+  layout
+}) {
+  if (!isUuid(projectId)) throw new Error("projectId debe ser un UUID válido.");
+
+  const number = Math.max(1, Number(sheetNumber) || 1);
+  const width = Number(widthCm);
+  const height = Number(heightCm);
+
+  validateSheet(width, height);
+
+  if (!Array.isArray(layout)) {
+    throw new Error("layout debe ser un arreglo JSON.");
+  }
+
+  const query =
+    `sheets?project_id=eq.${encodeURIComponent(projectId)}` +
+    `&sheet_number=eq.${encodeURIComponent(number)}` +
+    `&select=*`;
+
+  const existing = await supabaseRequest(query);
+  const now = new Date().toISOString();
+
+  if (Array.isArray(existing) && existing[0]?.id) {
+    const rows = await supabaseRequest(
+      `sheets?id=eq.${encodeURIComponent(existing[0].id)}&select=*`,
+      {
+        method: "PATCH",
+        prefer: "return=representation",
+        body: {
+          width_cm: width,
+          height_cm: height,
+          layout,
+          updated_at: now
+        }
+      }
+    );
+
+    return Array.isArray(rows) ? rows[0] : rows;
+  }
+
+  const rows = await supabaseRequest("sheets?select=*", {
+    method: "POST",
+    prefer: "return=representation",
+    body: {
+      project_id: projectId,
+      sheet_number: number,
+      width_cm: width,
+      height_cm: height,
+      layout
+    }
+  });
+
+  return Array.isArray(rows) ? rows[0] : rows;
+}
+
+async function createRenderJob(projectId, sheetId) {
+  const rows = await supabaseRequest("render_jobs?select=*", {
+    method: "POST",
+    prefer: "return=representation",
+    body: {
+      project_id: projectId,
+      sheet_id: sheetId,
+      status: "queued",
+      attempts: 0
+    }
+  });
+
+  return Array.isArray(rows) ? rows[0] : rows;
+}
+
+async function updateRenderJob(jobId, patch) {
+  if (!jobId) return null;
+
+  try {
+    const rows = await supabaseRequest(
+      `render_jobs?id=eq.${encodeURIComponent(jobId)}&select=*`,
+      {
+        method: "PATCH",
+        prefer: "return=representation",
+        body: patch
+      }
+    );
+    return Array.isArray(rows) ? rows[0] : rows;
+  } catch (error) {
+    console.error("render_jobs update:", error);
+    return null;
+  }
 }
 
 app.use((req, res, next) => {
@@ -421,23 +572,38 @@ app.post("/projects", async (req, res) => {
 
 app.post("/upload-url", async (req, res) => {
   try {
-    const projectId = safeFilePart(
-      req.body?.projectId || randomId("bix_")
-    );
+    const projectId = String(req.body?.projectId || "");
 
-    const assetId = safeFilePart(
-      req.body?.assetId || randomId("asset_")
-    );
+    if (!isUuid(projectId)) {
+      return res.status(400).json({
+        ok: false,
+        error: "projectId debe ser un UUID válido creado por /projects."
+      });
+    }
 
     const originalName = safeFilePart(
       req.body?.filename || "artwork.png"
     );
 
     const contentType = normalizeContentType(req.body?.contentType);
+    const assetId = crypto.randomUUID();
 
     const objectPath =
       `projects/${projectId}/assets/originals/` +
       `${assetId}_${originalName}`;
+
+    const widthPx =
+      Number.isFinite(Number(req.body?.widthPx)) ? Number(req.body.widthPx) : null;
+    const heightPx =
+      Number.isFinite(Number(req.body?.heightPx)) ? Number(req.body.heightPx) : null;
+    const dpiX =
+      Number.isFinite(Number(req.body?.dpiX)) ? Number(req.body.dpiX) : null;
+    const dpiY =
+      Number.isFinite(Number(req.body?.dpiY)) ? Number(req.body.dpiY) : null;
+    const fileSizeBytes =
+      Number.isFinite(Number(req.body?.fileSizeBytes))
+        ? Math.max(0, Math.round(Number(req.body.fileSizeBytes)))
+        : null;
 
     const file = bucket.file(objectPath);
     const expiresAt = Date.now() + 15 * 60 * 1000;
@@ -447,6 +613,25 @@ app.post("/upload-url", async (req, res) => {
       action: "write",
       expires: expiresAt,
       contentType
+    });
+
+    await supabaseRequest("assets?select=*", {
+      method: "POST",
+      prefer: "return=representation",
+      body: {
+        id: assetId,
+        project_id: projectId,
+        original_name: originalName,
+        storage_path: objectPath,
+        thumbnail_path: null,
+        mime_type: contentType,
+        width_px: widthPx,
+        height_px: heightPx,
+        dpi_x: dpiX,
+        dpi_y: dpiY,
+        file_size_bytes: fileSizeBytes,
+        upload_status: "pending"
+      }
     });
 
     res.json({
@@ -460,9 +645,10 @@ app.post("/upload-url", async (req, res) => {
     });
   } catch (error) {
     console.error("upload-url:", error);
-    res.status(500).json({
+    res.status(error?.status === 403 ? 502 : 500).json({
       ok: false,
-      error: error?.message || String(error)
+      error: error?.message || String(error),
+      supabaseStatus: error?.status || null
     });
   }
 });
@@ -478,18 +664,76 @@ app.post("/asset-status", async (req, res) => {
     }
 
     const [metadata] = await file.getMetadata();
+    const bytes = Number(metadata.size || 0);
+    const contentType = metadata.contentType || null;
+
+    let asset = null;
+    try {
+      const rows = await supabaseRequest(
+        `assets?storage_path=eq.${encodeURIComponent(objectPath)}&select=*`,
+        {
+          method: "PATCH",
+          prefer: "return=representation",
+          body: {
+            upload_status: "uploaded",
+            file_size_bytes: bytes || null,
+            mime_type: contentType
+          }
+        }
+      );
+      asset = Array.isArray(rows) ? rows[0] : rows;
+    } catch (error) {
+      console.error("asset-status db update:", error);
+    }
 
     res.json({
       ok: true,
       exists: true,
       objectPath,
-      bytes: Number(metadata.size || 0),
-      contentType: metadata.contentType || null
+      bytes,
+      contentType,
+      assetId: asset?.id || null,
+      uploadStatus: asset?.upload_status || "uploaded"
     });
   } catch (error) {
     res.status(400).json({
       ok: false,
       error: error?.message || String(error)
+    });
+  }
+});
+
+app.post("/sheets", async (req, res) => {
+  try {
+    const projectId = String(req.body?.projectId || "");
+    const sheetNumber = Math.max(1, Number(req.body?.sheetNumber) || 1);
+    const widthCm = Number(req.body?.widthCm);
+    const heightCm = Number(req.body?.heightCm);
+    const layout = Array.isArray(req.body?.layout) ? req.body.layout : [];
+
+    const sheet = await ensureSheetRecord({
+      projectId,
+      sheetNumber,
+      widthCm,
+      heightCm,
+      layout
+    });
+
+    res.json({
+      ok: true,
+      projectId,
+      sheetId: sheet?.id || null,
+      sheetNumber: sheet?.sheet_number ?? sheetNumber,
+      widthCm: Number(sheet?.width_cm ?? widthCm),
+      heightCm: Number(sheet?.height_cm ?? heightCm),
+      updatedAt: sheet?.updated_at || null
+    });
+  } catch (error) {
+    console.error("sheets:", error);
+    res.status(error?.status ? 502 : 400).json({
+      ok: false,
+      error: error?.message || String(error),
+      supabaseStatus: error?.status || null
     });
   }
 });
@@ -532,34 +776,90 @@ app.post("/download-url", async (req, res) => {
 
 app.post("/render-sheet", async (req, res) => {
   const started = Date.now();
+  let renderJob = null;
 
   try {
-    const projectId = safeFilePart(
-      req.body?.projectId || "test_project"
-    );
+    const projectId = String(req.body?.projectId || "");
+
+    if (!isUuid(projectId)) {
+      return res.status(400).json({
+        ok: false,
+        error: "projectId debe ser un UUID válido."
+      });
+    }
 
     const sheet = req.body?.sheet || {};
     const objects = Array.isArray(req.body?.objects)
       ? req.body.objects
       : [];
 
+    const sheetNumber = Math.max(1, Number(sheet.sheetNumber) || 1);
+    const widthCm = Number(sheet.widthCm);
+    const heightCm = Number(sheet.heightCm);
+
+    const sheetRow = await ensureSheetRecord({
+      projectId,
+      sheetNumber,
+      widthCm,
+      heightCm,
+      layout: objects
+    });
+
+    if (!sheetRow?.id) {
+      throw new Error("No se pudo obtener el sheet_id de Supabase.");
+    }
+
+    renderJob = await createRenderJob(projectId, sheetRow.id);
+
+    await updateRenderJob(renderJob?.id, {
+      status: "processing",
+      attempts: Math.max(1, Number(renderJob?.attempts || 0) + 1),
+      started_at: new Date().toISOString(),
+      error_message: null
+    });
+
     const rendered = await renderSheetToStorage({
       projectId,
-      sheet,
+      sheet: {
+        ...sheet,
+        sheetNumber,
+        widthCm,
+        heightCm
+      },
       objects
+    });
+
+    await updateRenderJob(renderJob?.id, {
+      status: "completed",
+      output_path: rendered.outputPath,
+      finished_at: new Date().toISOString(),
+      error_message: null
     });
 
     res.json({
       ok: true,
       projectId,
+      sheetId: sheetRow.id,
+      renderJobId: renderJob?.id || null,
       ...rendered,
       renderMs: Date.now() - started
     });
   } catch (error) {
     console.error("render-sheet:", error);
-    res.status(400).json({
+
+    if (renderJob?.id) {
+      await updateRenderJob(renderJob.id, {
+        status: "failed",
+        error_message: String(error?.message || error).slice(0, 2000),
+        finished_at: new Date().toISOString()
+      });
+    }
+
+    res.status(error?.status ? 502 : 400).json({
       ok: false,
-      error: error?.message || String(error)
+      renderJobId: renderJob?.id || null,
+      error: error?.message || String(error),
+      supabaseStatus: error?.status || null
     });
   }
 });
