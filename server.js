@@ -8,7 +8,7 @@ const storage = new Storage();
 
 app.use(express.json({ limit: "5mb" }));
 
-const VERSION = "2.1.0";
+const VERSION = "2.2.0";
 const DPI = 300;
 const PX_PER_CM = DPI / 2.54;
 const BUCKET_NAME =
@@ -318,9 +318,101 @@ app.get("/health", async (req, res) => {
   }
 });
 
-app.post("/projects", (req, res) => {
-  const projectId = randomId("bix_");
-  res.json({ ok: true, projectId });
+app.post("/projects", async (req, res) => {
+  try {
+    if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
+      return res.status(503).json({
+        ok: false,
+        error: "Supabase no está configurado en Cloud Run."
+      });
+    }
+
+    const totalWidthCmRaw = req.body?.totalWidthCm;
+    const totalHeightCmRaw = req.body?.totalHeightCm;
+
+    const totalWidthCm =
+      totalWidthCmRaw === undefined || totalWidthCmRaw === null
+        ? null
+        : Number(totalWidthCmRaw);
+
+    const totalHeightCm =
+      totalHeightCmRaw === undefined || totalHeightCmRaw === null
+        ? null
+        : Number(totalHeightCmRaw);
+
+    if (totalWidthCm !== null && !Number.isFinite(totalWidthCm)) {
+      return res.status(400).json({
+        ok: false,
+        error: "totalWidthCm debe ser numérico."
+      });
+    }
+
+    if (totalHeightCm !== null && !Number.isFinite(totalHeightCm)) {
+      return res.status(400).json({
+        ok: false,
+        error: "totalHeightCm debe ser numérico."
+      });
+    }
+
+    const payload = {
+      status: "editing"
+    };
+
+    if (totalWidthCm !== null) payload.total_width_cm = totalWidthCm;
+    if (totalHeightCm !== null) payload.total_height_cm = totalHeightCm;
+
+    const response = await fetch(`${getSupabaseRestRoot()}projects`, {
+      method: "POST",
+      headers: {
+        apikey: SUPABASE_SECRET_KEY,
+        Authorization: `Bearer ${SUPABASE_SECRET_KEY}`,
+        "Content-Type": "application/json",
+        Prefer: "return=representation"
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(10000)
+    });
+
+    const text = await response.text();
+
+    let data = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch (_) {
+      data = null;
+    }
+
+    if (!response.ok) {
+      console.error("projects insert:", response.status, text);
+      return res.status(502).json({
+        ok: false,
+        error: "No se pudo crear el proyecto en Supabase.",
+        status: response.status
+      });
+    }
+
+    const row = Array.isArray(data) ? data[0] : data;
+
+    if (!row?.id) {
+      return res.status(502).json({
+        ok: false,
+        error: "Supabase creó el registro pero no devolvió el ID."
+      });
+    }
+
+    res.json({
+      ok: true,
+      projectId: row.id,
+      status: row.status || "editing",
+      createdAt: row.created_at || null
+    });
+  } catch (error) {
+    console.error("projects:", error);
+    res.status(500).json({
+      ok: false,
+      error: error?.message || String(error)
+    });
+  }
 });
 
 app.post("/upload-url", async (req, res) => {
