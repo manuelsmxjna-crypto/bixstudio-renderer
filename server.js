@@ -2,19 +2,28 @@ import express from "express";
 import sharp from "sharp";
 import { Storage } from "@google-cloud/storage";
 import crypto from "node:crypto";
+import { CloudTasksClient } from "@google-cloud/tasks";
 
 const app = express();
 const storage = new Storage();
 
 app.use(express.json({ limit: "5mb" }));
 
-const VERSION = "2.4.0";
+const VERSION = "2.5.0";
 const DPI = 300;
 const PX_PER_CM = DPI / 2.54;
 const BUCKET_NAME =
   process.env.BIXSTUDIO_BUCKET || "bixstudio-files-318403647962";
 
 const bucket = storage.bucket(BUCKET_NAME);
+
+const tasksClient = new CloudTasksClient();
+const TASKS_LOCATION = process.env.TASKS_LOCATION || "us-central1";
+const TASKS_QUEUE = process.env.TASKS_QUEUE || "bixstudio-render";
+const PUBLIC_BASE_URL = (
+  process.env.BIX_RENDERER_PUBLIC_URL ||
+  "https://bixstudio-renderer-318403647962.us-central1.run.app"
+).replace(/\/$/, "");
 
 const SUPABASE_URL = String(process.env.SUPABASE_URL || "").replace(/\/$/, "");
 const SUPABASE_SECRET_KEY = String(process.env.SUPABASE_SECRET_KEY || "");
@@ -85,6 +94,79 @@ async function supabaseRequest(path, {
   }
 
   return data;
+}
+
+
+function signTaskBody(bodyText) {
+  return crypto
+    .createHmac("sha256", SUPABASE_SECRET_KEY)
+    .update(bodyText)
+    .digest("hex");
+}
+
+function verifyTaskSignature(bodyText, signature) {
+  const expected = signTaskBody(bodyText);
+  const a = Buffer.from(expected);
+  const b = Buffer.from(String(signature || ""));
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+async function enqueueRenderTask(payload) {
+  const projectId =
+    process.env.GOOGLE_CLOUD_PROJECT ||
+    process.env.GCLOUD_PROJECT;
+
+  if (!projectId) {
+    throw new Error("No se pudo determinar GOOGLE_CLOUD_PROJECT.");
+  }
+
+  const parent = tasksClient.queuePath(
+    projectId,
+    TASKS_LOCATION,
+    TASKS_QUEUE
+  );
+
+  const bodyText = JSON.stringify(payload);
+  const signature = signTaskBody(bodyText);
+
+  const task = {
+    httpRequest: {
+      httpMethod: "POST",
+      url: `${PUBLIC_BASE_URL}/render-worker`,
+      headers: {
+        "Content-Type": "application/json",
+        "X-BixStudio-Task-Signature": signature
+      },
+      body: Buffer.from(bodyText).toString("base64")
+    },
+    dispatchDeadline: {
+      seconds: 1800
+    }
+  };
+
+  const [created] = await tasksClient.createTask({ parent, task });
+  return created?.name || null;
+}
+
+async function getRenderJob(jobId) {
+  if (!isUuid(jobId)) throw new Error("renderJobId inválido.");
+  const rows = await supabaseRequest(
+    `render_jobs?id=eq.${encodeURIComponent(jobId)}&select=*`
+  );
+  return Array.isArray(rows) ? rows[0] || null : rows || null;
+}
+
+async function signedReadUrl(objectPath, expiresMs = 60 * 60 * 1000) {
+  const path = validateObjectPath(objectPath);
+  const file = bucket.file(path);
+  const [exists] = await file.exists();
+  if (!exists) throw new Error("El archivo final todavía no existe.");
+  const [url] = await file.getSignedUrl({
+    version: "v4",
+    action: "read",
+    expires: Date.now() + expiresMs
+  });
+  return url;
 }
 
 async function ensureSheetRecord({
@@ -570,6 +652,181 @@ app.post("/projects", async (req, res) => {
   }
 });
 
+
+app.post("/upload-urls", async (req, res) => {
+  try {
+    const projectId = String(req.body?.projectId || "");
+    const items = Array.isArray(req.body?.assets) ? req.body.assets : [];
+
+    if (!isUuid(projectId)) {
+      return res.status(400).json({
+        ok: false,
+        error: "projectId debe ser un UUID válido."
+      });
+    }
+
+    if (!items.length || items.length > 50) {
+      return res.status(400).json({
+        ok: false,
+        error: "assets debe contener entre 1 y 50 elementos."
+      });
+    }
+
+    const prepared = items.map((item, index) => {
+      const originalName = safeFilePart(item?.filename || `asset_${index + 1}.png`);
+      const contentType = normalizeContentType(item?.contentType);
+      const assetId = crypto.randomUUID();
+      const objectPath =
+        `projects/${projectId}/assets/originals/` +
+        `${assetId}_${originalName}`;
+
+      const finiteOrNull = value => {
+        const n = Number(value);
+        return Number.isFinite(n) ? n : null;
+      };
+
+      return {
+        clientId: item?.clientId || null,
+        assetId,
+        objectPath,
+        originalName,
+        contentType,
+        widthPx: finiteOrNull(item?.widthPx),
+        heightPx: finiteOrNull(item?.heightPx),
+        dpiX: finiteOrNull(item?.dpiX),
+        dpiY: finiteOrNull(item?.dpiY),
+        fileSizeBytes: finiteOrNull(item?.fileSizeBytes)
+      };
+    });
+
+    const expiresAt = Date.now() + 30 * 60 * 1000;
+
+    const uploadUrls = await Promise.all(
+      prepared.map(async item => {
+        const [uploadUrl] = await bucket.file(item.objectPath).getSignedUrl({
+          version: "v4",
+          action: "write",
+          expires: expiresAt,
+          contentType: item.contentType
+        });
+        return uploadUrl;
+      })
+    );
+
+    await supabaseRequest("assets", {
+      method: "POST",
+      prefer: "return=minimal",
+      body: prepared.map(item => ({
+        id: item.assetId,
+        project_id: projectId,
+        original_name: item.originalName,
+        storage_path: item.objectPath,
+        thumbnail_path: null,
+        mime_type: item.contentType,
+        width_px: item.widthPx,
+        height_px: item.heightPx,
+        dpi_x: item.dpiX,
+        dpi_y: item.dpiY,
+        file_size_bytes: item.fileSizeBytes,
+        upload_status: "pending"
+      }))
+    });
+
+    res.json({
+      ok: true,
+      projectId,
+      expiresAt,
+      assets: prepared.map((item, index) => ({
+        clientId: item.clientId,
+        assetId: item.assetId,
+        objectPath: item.objectPath,
+        storagePath: item.objectPath,
+        contentType: item.contentType,
+        uploadUrl: uploadUrls[index]
+      }))
+    });
+  } catch (error) {
+    console.error("upload-urls:", error);
+    res.status(error?.status ? 502 : 500).json({
+      ok: false,
+      error: error?.message || String(error),
+      supabaseStatus: error?.status || null
+    });
+  }
+});
+
+app.post("/assets-confirm", async (req, res) => {
+  try {
+    const objectPaths = Array.isArray(req.body?.objectPaths)
+      ? [...new Set(req.body.objectPaths.map(String))]
+      : [];
+
+    if (!objectPaths.length || objectPaths.length > 100) {
+      return res.status(400).json({
+        ok: false,
+        error: "objectPaths debe contener entre 1 y 100 rutas."
+      });
+    }
+
+    const results = await Promise.all(
+      objectPaths.map(async objectPath => {
+        try {
+          const path = validateObjectPath(objectPath);
+          const file = bucket.file(path);
+          const [exists] = await file.exists();
+          if (!exists) return { objectPath: path, exists: false };
+
+          const [metadata] = await file.getMetadata();
+          const bytes = Number(metadata.size || 0);
+          const contentType = metadata.contentType || null;
+
+          try {
+            await supabaseRequest(
+              `assets?storage_path=eq.${encodeURIComponent(path)}`,
+              {
+                method: "PATCH",
+                prefer: "return=minimal",
+                body: {
+                  upload_status: "uploaded",
+                  file_size_bytes: bytes || null,
+                  mime_type: contentType
+                }
+              }
+            );
+          } catch (dbError) {
+            console.error("assets-confirm db:", dbError);
+          }
+
+          return {
+            objectPath: path,
+            exists: true,
+            bytes,
+            contentType
+          };
+        } catch (error) {
+          return {
+            objectPath,
+            exists: false,
+            error: error?.message || String(error)
+          };
+        }
+      })
+    );
+
+    res.json({
+      ok: true,
+      confirmed: results.filter(x => x.exists).length,
+      total: results.length,
+      results
+    });
+  } catch (error) {
+    res.status(400).json({
+      ok: false,
+      error: error?.message || String(error)
+    });
+  }
+});
+
 app.post("/upload-url", async (req, res) => {
   try {
     const projectId = String(req.body?.projectId || "");
@@ -771,6 +1028,232 @@ app.post("/download-url", async (req, res) => {
       ok: false,
       error: error?.message || String(error)
     });
+  }
+});
+
+
+app.post("/render-queue", async (req, res) => {
+  try {
+    const projectId = String(req.body?.projectId || "");
+    if (!isUuid(projectId)) {
+      return res.status(400).json({
+        ok: false,
+        error: "projectId debe ser un UUID válido."
+      });
+    }
+
+    const sheet = req.body?.sheet || {};
+    const objects = Array.isArray(req.body?.objects) ? req.body.objects : [];
+    const sheetNumber = Math.max(1, Number(sheet.sheetNumber) || 1);
+    const widthCm = Number(sheet.widthCm);
+    const heightCm = Number(sheet.heightCm);
+
+    if (!objects.length) {
+      return res.status(400).json({
+        ok: false,
+        error: "La hoja no contiene diseños."
+      });
+    }
+
+    const sheetRow = await ensureSheetRecord({
+      projectId,
+      sheetNumber,
+      widthCm,
+      heightCm,
+      layout: objects
+    });
+
+    if (!sheetRow?.id) {
+      throw new Error("No se pudo crear/actualizar la hoja.");
+    }
+
+    const renderJob = await createRenderJob(projectId, sheetRow.id);
+    if (!renderJob?.id) {
+      throw new Error("No se pudo crear render_job.");
+    }
+
+    const taskPayload = {
+      renderJobId: renderJob.id,
+      projectId,
+      sheetId: sheetRow.id,
+      sheet: {
+        ...sheet,
+        sheetNumber,
+        widthCm,
+        heightCm
+      },
+      objects
+    };
+
+    let taskName = null;
+    try {
+      taskName = await enqueueRenderTask(taskPayload);
+    } catch (queueError) {
+      await updateRenderJob(renderJob.id, {
+        status: "failed",
+        error_message: `No se pudo encolar: ${queueError?.message || queueError}`,
+        finished_at: new Date().toISOString()
+      });
+      throw queueError;
+    }
+
+    res.status(202).json({
+      ok: true,
+      queued: true,
+      projectId,
+      sheetId: sheetRow.id,
+      renderJobId: renderJob.id,
+      taskName,
+      printFileUrl: `${PUBLIC_BASE_URL}/print-file/${renderJob.id}`
+    });
+  } catch (error) {
+    console.error("render-queue:", error);
+    res.status(error?.status ? 502 : 500).json({
+      ok: false,
+      error: error?.message || String(error),
+      supabaseStatus: error?.status || null
+    });
+  }
+});
+
+app.post("/render-worker", async (req, res) => {
+  const bodyText = JSON.stringify(req.body || {});
+  const signature = req.get("X-BixStudio-Task-Signature");
+
+  if (!verifyTaskSignature(bodyText, signature)) {
+    return res.status(403).json({
+      ok: false,
+      error: "Firma de tarea inválida."
+    });
+  }
+
+  const payload = req.body || {};
+  const renderJobId = String(payload.renderJobId || "");
+
+  if (!isUuid(renderJobId)) {
+    return res.status(400).json({
+      ok: false,
+      error: "renderJobId inválido."
+    });
+  }
+
+  try {
+    await updateRenderJob(renderJobId, {
+      status: "processing",
+      attempts: 1,
+      started_at: new Date().toISOString(),
+      error_message: null
+    });
+
+    const rendered = await renderSheetToStorage({
+      projectId: payload.projectId,
+      sheet: payload.sheet,
+      objects: Array.isArray(payload.objects) ? payload.objects : []
+    });
+
+    await updateRenderJob(renderJobId, {
+      status: "completed",
+      output_path: rendered.outputPath,
+      error_message: null,
+      finished_at: new Date().toISOString()
+    });
+
+    res.json({
+      ok: true,
+      renderJobId,
+      outputPath: rendered.outputPath
+    });
+  } catch (error) {
+    console.error("render-worker:", error);
+    await updateRenderJob(renderJobId, {
+      status: "failed",
+      error_message: String(error?.message || error).slice(0, 2000),
+      finished_at: new Date().toISOString()
+    });
+
+    res.status(500).json({
+      ok: false,
+      renderJobId,
+      error: error?.message || String(error)
+    });
+  }
+});
+
+app.get("/render-job/:id", async (req, res) => {
+  try {
+    const job = await getRenderJob(req.params.id);
+    if (!job) {
+      return res.status(404).json({
+        ok: false,
+        error: "Render job no encontrado."
+      });
+    }
+
+    res.json({
+      ok: true,
+      renderJobId: job.id,
+      status: job.status,
+      attempts: job.attempts,
+      outputPath: job.output_path,
+      error: job.error_message,
+      createdAt: job.created_at,
+      startedAt: job.started_at,
+      finishedAt: job.finished_at,
+      printFileUrl: `${PUBLIC_BASE_URL}/print-file/${job.id}`
+    });
+  } catch (error) {
+    res.status(400).json({
+      ok: false,
+      error: error?.message || String(error)
+    });
+  }
+});
+
+app.get("/print-file/:id", async (req, res) => {
+  try {
+    const job = await getRenderJob(req.params.id);
+    if (!job) {
+      return res.status(404).type("html").send(
+        "<!doctype html><meta charset='utf-8'><title>Archivo no encontrado</title><h2>Archivo no encontrado</h2>"
+      );
+    }
+
+    if (job.status === "completed" && job.output_path) {
+      const url = await signedReadUrl(job.output_path);
+      return res.redirect(302, url);
+    }
+
+    const failed = job.status === "failed";
+    const title = failed ? "No se pudo procesar el archivo" : "Tu archivo se está procesando";
+    const detail = failed
+      ? "El procesamiento encontró un error. BixPrint puede reintentar el trabajo desde el panel."
+      : "El pedido ya fue recibido. El archivo de impresión se está generando y esta página se actualizará automáticamente.";
+
+    const refresh = failed ? "" : "<meta http-equiv='refresh' content='5'>";
+
+    return res.status(failed ? 500 : 202).type("html").send(`<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+${refresh}
+<title>${title}</title>
+<style>
+body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#f5f6f8;color:#111827;margin:0;display:grid;place-items:center;min-height:100vh}
+.card{width:min(560px,calc(100% - 32px));background:white;border:1px solid #e5e7eb;border-radius:16px;padding:28px;box-shadow:0 12px 36px rgba(15,23,42,.08)}
+h1{font-size:22px;margin:0 0 10px}p{color:#64748b;line-height:1.55}.status{display:inline-block;background:#f1f5f9;padding:7px 10px;border-radius:999px;font-size:13px;font-weight:700}
+</style>
+</head>
+<body><div class="card">
+<div class="status">${String(job.status || "queued")}</div>
+<h1>${title}</h1>
+<p>${detail}</p>
+<p><small>ID: ${job.id}</small></p>
+</div></body></html>`);
+  } catch (error) {
+    res.status(500).type("html").send(
+      `<!doctype html><meta charset="utf-8"><title>Error</title><h2>Error</h2><p>${String(error?.message || error)}</p>`
+    );
   }
 });
 
