@@ -9,7 +9,7 @@ const storage = new Storage();
 
 app.use(express.json({ limit: "5mb" }));
 
-const VERSION = "2.5.0";
+const VERSION = "2.6.0";
 const DPI = 300;
 const PX_PER_CM = DPI / 2.54;
 const BUCKET_NAME =
@@ -401,19 +401,54 @@ async function renderSheetToStorage({ projectId, sheet, objects }) {
     const left = Math.round(cx - r.width / 2);
     const top = Math.round(cy - r.height / 2);
 
+    // Clip against the physical sheet instead of failing the whole job.
+    // Completely-outside objects are ignored. Partially-outside objects
+    // are cropped so only the portion that falls on the artboard is printed.
+    const destLeft = Math.max(0, left);
+    const destTop = Math.max(0, top);
+    const destRight = Math.min(canvasW, left + r.width);
+    const destBottom = Math.min(canvasH, top + r.height);
+
+    const clipW = Math.floor(destRight - destLeft);
+    const clipH = Math.floor(destBottom - destTop);
+
+    if (clipW <= 0 || clipH <= 0) {
+      console.warn("render-sheet: objeto completamente fuera, se omite", {
+        id: o.id || null,
+        left,
+        top,
+        width: r.width,
+        height: r.height
+      });
+      continue;
+    }
+
+    let input = r.png;
+
     if (
-      left < 0 ||
-      top < 0 ||
-      left + r.width > canvasW ||
-      top + r.height > canvasH
+      destLeft !== left ||
+      destTop !== top ||
+      clipW !== r.width ||
+      clipH !== r.height
     ) {
-      throw new Error("Un diseño queda fuera de la hoja al renderizarlo.");
+      const srcLeft = Math.max(0, destLeft - left);
+      const srcTop = Math.max(0, destTop - top);
+
+      input = await sharp(r.png, { failOn: "none" })
+        .extract({
+          left: Math.round(srcLeft),
+          top: Math.round(srcTop),
+          width: clipW,
+          height: clipH
+        })
+        .png({ compressionLevel: 4 })
+        .toBuffer();
     }
 
     composites.push({
-      input: r.png,
-      left,
-      top,
+      input,
+      left: Math.round(destLeft),
+      top: Math.round(destTop),
       blend: "over"
     });
   }
