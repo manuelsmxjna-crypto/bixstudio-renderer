@@ -8,7 +8,7 @@ const storage = new Storage();
 
 app.use(express.json({ limit: "5mb" }));
 
-const VERSION = "2.2.0";
+const VERSION = "2.3.0";
 const DPI = 300;
 const PX_PER_CM = DPI / 2.54;
 const BUCKET_NAME =
@@ -365,7 +365,6 @@ app.post("/projects", async (req, res) => {
       method: "POST",
       headers: {
         apikey: SUPABASE_SECRET_KEY,
-        Authorization: `Bearer ${SUPABASE_SECRET_KEY}`,
         "Content-Type": "application/json",
         Prefer: "return=representation"
       },
@@ -387,7 +386,12 @@ app.post("/projects", async (req, res) => {
       return res.status(502).json({
         ok: false,
         error: "No se pudo crear el proyecto en Supabase.",
-        status: response.status
+        status: response.status,
+        supabaseError:
+          data?.message ||
+          data?.error ||
+          data?.hint ||
+          (typeof data === "string" ? data : null)
       });
     }
 
