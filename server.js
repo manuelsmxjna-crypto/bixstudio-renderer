@@ -13,6 +13,7 @@ import {
   makeReadySheetPreview,
   READY_SHEET_MAX_BYTES
 } from "./ready-sheet.js";
+import { buildReadySheetHttpRequest } from "./ready-sheet-task.js";
 
 const app = express();
 const storage = new Storage();
@@ -158,6 +159,19 @@ async function enqueueRenderTask(payload) {
   return created?.name || null;
 }
 
+function signReadySheetTaskBody(bodyText) {
+  const secret = process.env.READY_SHEET_TASK_SECRET;
+  if (!secret) throw new Error("Configura READY_SHEET_TASK_SECRET antes de encolar trabajos.");
+  return crypto.createHmac("sha256", secret).update(bodyText).digest("hex");
+}
+
+function verifyReadySheetTaskSignature(bodyText, signature) {
+  const expected = signReadySheetTaskBody(bodyText);
+  const a = Buffer.from(expected);
+  const b = Buffer.from(String(signature || ""));
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
 async function enqueueReadySheetTask(payload) {
   const cloudProject = process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT;
   if (!cloudProject) throw new Error("No se pudo determinar GOOGLE_CLOUD_PROJECT.");
@@ -166,15 +180,12 @@ async function enqueueReadySheetTask(payload) {
   const [created] = await tasksClient.createTask({
     parent,
     task: {
-      httpRequest: {
-        httpMethod: "POST",
-        url: `${PUBLIC_BASE_URL}/ready-sheets/worker`,
-        headers: {
-          "Content-Type": "application/json",
-          "X-BixStudio-Task-Signature": signTaskBody(bodyText)
-        },
-        body: Buffer.from(bodyText).toString("base64")
-      },
+      httpRequest: buildReadySheetHttpRequest({
+        baseUrl: PUBLIC_BASE_URL,
+        serviceAccountEmail: process.env.READY_SHEET_TASK_SERVICE_ACCOUNT,
+        bodyText,
+        signature: signReadySheetTaskBody(bodyText)
+      }),
       dispatchDeadline: { seconds: 1800 }
     }
   });
@@ -951,6 +962,10 @@ app.post("/ready-sheets/jobs", async (req, res) => {
       error: "Configura BIX_RENDERER_PUBLIC_URL con la URL de este servicio antes de encolar trabajos."
     });
   }
+  if (!process.env.READY_SHEET_TASK_SERVICE_ACCOUNT || !process.env.READY_SHEET_TASK_SECRET) {
+    return res.status(503).json({ ok: false,
+      error: "Configura READY_SHEET_TASK_SERVICE_ACCOUNT y READY_SHEET_TASK_SECRET antes de encolar trabajos." });
+  }
   let job = null;
   try {
     const projectId = String(req.body?.projectId || "");
@@ -985,7 +1000,7 @@ app.get("/ready-sheets/jobs/:jobId", async (req, res) => {
 
 app.post("/ready-sheets/worker", async (req, res) => {
   const bodyText = JSON.stringify(req.body || {});
-  if (!verifyTaskSignature(bodyText, req.get("X-BixStudio-Task-Signature"))) {
+  if (!verifyReadySheetTaskSignature(bodyText, req.get("X-BixStudio-Task-Signature"))) {
     return res.status(403).json({ ok: false, error: "Firma de tarea inválida." });
   }
   const { projectId, jobId, objectPath } = req.body || {};

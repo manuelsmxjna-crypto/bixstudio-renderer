@@ -6,7 +6,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test ready-sheet.test.js"
+    "test": "node --test ready-sheet.test.js ready-sheet-task.test.js"
   },
   "engines": {
     "node": "24.x"
