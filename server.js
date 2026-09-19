@@ -944,6 +944,13 @@ app.post("/ready-sheets/jobs", async (req, res) => {
   if (process.env.READY_SHEET_ANALYSIS_ENABLED !== "true") {
     return res.status(503).json({ ok: false, error: "El análisis experimental de lienzos está desactivado." });
   }
+  const configuredBase = process.env.BIX_RENDERER_PUBLIC_URL;
+  if (!configuredBase || new URL(configuredBase).host !== req.get("host")) {
+    return res.status(503).json({
+      ok: false,
+      error: "Configura BIX_RENDERER_PUBLIC_URL con la URL de este servicio antes de encolar trabajos."
+    });
+  }
   let job = null;
   try {
     const projectId = String(req.body?.projectId || "");

@@ -2,6 +2,8 @@
 
 El flujo experimental está **desactivado por defecto**. Para habilitarlo en un entorno de prueba, configurar `READY_SHEET_ANALYSIS_ENABLED=true`. No forma parte todavía del checkout ni modifica `/render-queue`.
 
+Además, `BIX_RENDERER_PUBLIC_URL` debe establecerse explícitamente a la URL del **servicio de pruebas**. La ruta de creación de trabajos rechaza solicitudes si esa URL no coincide con el host que recibió la solicitud; así la cola nunca apunta por accidente al renderer de producción.
+
 `POST /ready-sheets/jobs` recibe un archivo ya subido por las rutas existentes:
 
 ```json
