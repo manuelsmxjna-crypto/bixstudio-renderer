@@ -22,3 +22,5 @@ Límites iniciales: PNG, JPG, WEBP o TIFF de una sola página; máximo 128 MB co
 **Antes de habilitarlo en Cloud Run:** el archivo original se descarga a un temporal. El sistema de archivos escribible de Cloud Run normalmente consume memoria de la instancia, así que esta ruta requiere una instancia con memoria suficiente o un disco efímero configurado y pruebas de concurrencia. No habilitarlo en producción con el límite actual sin esas verificaciones. La cola puede reintentar fallos transitorios; el trabajo completado es idempotente.
 
 Pruebas locales: `npm test`.
+
+Para una prueba de peso sin usar diseños de clientes, `npm run generate:heavy-fixture` crea `ready-sheet-heavy-test.png` (7323 × 11811 px, 300 DPI, cerca de 70 MB). La composición tiene exactamente 14,440,000 píxeles opacos, 1,440,000 semitransparentes y márgenes transparentes; el archivo generado queda fuera de Git. El color aleatorio dificulta la compresión para ejercitar también la transferencia del archivo, no solo el tamaño expandido en memoria.

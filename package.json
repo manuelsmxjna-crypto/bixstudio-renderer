@@ -6,7 +6,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test ready-sheet.test.js ready-sheet-task.test.js"
+    "test": "node --test ready-sheet.test.js ready-sheet-task.test.js",
+    "generate:heavy-fixture": "node scripts/generate-heavy-ready-sheet.js"
   },
   "engines": {
     "node": "24.x"
