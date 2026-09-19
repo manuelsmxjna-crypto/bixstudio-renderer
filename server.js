@@ -3,6 +3,16 @@ import sharp from "sharp";
 import { Storage } from "@google-cloud/storage";
 import crypto from "node:crypto";
 import { CloudTasksClient } from "@google-cloud/tasks";
+import { createWriteStream } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pipeline } from "node:stream/promises";
+import {
+  analyzeReadySheetFile,
+  makeReadySheetPreview,
+  READY_SHEET_MAX_BYTES
+} from "./ready-sheet.js";
 
 const app = express();
 const storage = new Storage();
@@ -145,6 +155,29 @@ async function enqueueRenderTask(payload) {
   };
 
   const [created] = await tasksClient.createTask({ parent, task });
+  return created?.name || null;
+}
+
+async function enqueueReadySheetTask(payload) {
+  const cloudProject = process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT;
+  if (!cloudProject) throw new Error("No se pudo determinar GOOGLE_CLOUD_PROJECT.");
+  const parent = tasksClient.queuePath(cloudProject, TASKS_LOCATION, TASKS_QUEUE);
+  const bodyText = JSON.stringify(payload);
+  const [created] = await tasksClient.createTask({
+    parent,
+    task: {
+      httpRequest: {
+        httpMethod: "POST",
+        url: `${PUBLIC_BASE_URL}/ready-sheets/worker`,
+        headers: {
+          "Content-Type": "application/json",
+          "X-BixStudio-Task-Signature": signTaskBody(bodyText)
+        },
+        body: Buffer.from(bodyText).toString("base64")
+      },
+      dispatchDeadline: { seconds: 1800 }
+    }
+  });
   return created?.name || null;
 }
 
@@ -320,6 +353,7 @@ function normalizeContentType(type) {
     "image/png",
     "image/jpeg",
     "image/webp",
+    "image/tiff",
     "image/svg+xml",
     "application/octet-stream"
   ]);
@@ -858,6 +892,130 @@ app.post("/assets-confirm", async (req, res) => {
     res.status(400).json({
       ok: false,
       error: error?.message || String(error)
+    });
+  }
+});
+
+function readyJobPath(projectId, jobId) {
+  if (!isUuid(projectId) || !isUuid(jobId)) throw new Error("Identificador de trabajo inválido.");
+  return `projects/${projectId}/ready-jobs/${jobId}.json`;
+}
+
+async function saveReadyJob(job) {
+  await bucket.file(readyJobPath(job.projectId, job.jobId)).save(JSON.stringify(job), {
+    resumable: false,
+    contentType: "application/json",
+    metadata: { cacheControl: "private, max-age=0, no-store" }
+  });
+}
+
+async function getReadyJob(projectId, jobId) {
+  const file = bucket.file(readyJobPath(projectId, jobId));
+  const [exists] = await file.exists();
+  if (!exists) return null;
+  const [data] = await file.download(); // Only the small status manifest, never the artwork.
+  return JSON.parse(data.toString("utf8"));
+}
+
+async function validateReadySource(projectId, objectPath) {
+  if (!isUuid(projectId)) throw Object.assign(new Error("projectId inválido."), { status: 400 });
+  const path = validateObjectPath(objectPath);
+  if (!path.startsWith(`projects/${projectId}/assets/originals/`)) {
+    throw Object.assign(new Error("El archivo no pertenece al proyecto indicado."), { status: 400 });
+  }
+  const source = bucket.file(path);
+  const [exists] = await source.exists();
+  if (!exists) throw Object.assign(new Error("No se encontró el archivo original."), { status: 404 });
+  const [metadata] = await source.getMetadata();
+  const bytes = Number(metadata.size || 0);
+  if (!Number.isSafeInteger(bytes) || bytes <= 0 || bytes > READY_SHEET_MAX_BYTES) {
+    throw Object.assign(new Error("El archivo supera el límite experimental de 128 MB."), { status: 413 });
+  }
+  const type = String(metadata.contentType || "").toLowerCase();
+  if (!["image/png", "image/jpeg", "image/webp", "image/tiff"].includes(type)) {
+    throw Object.assign(new Error("Por ahora se aceptan PNG, JPG, WEBP y TIFF."), { status: 415 });
+  }
+  return { source, bytes, path };
+}
+
+// Experimental path: one background job per already-uploaded complete sheet.
+// The original remains untouched, and this does not call /render-queue.
+app.post("/ready-sheets/jobs", async (req, res) => {
+  if (process.env.READY_SHEET_ANALYSIS_ENABLED !== "true") {
+    return res.status(503).json({ ok: false, error: "El análisis experimental de lienzos está desactivado." });
+  }
+  let job = null;
+  try {
+    const projectId = String(req.body?.projectId || "");
+    const { path, bytes } = await validateReadySource(projectId, req.body?.objectPath);
+    const jobId = crypto.randomUUID();
+    job = { jobId, projectId, originalPath: path, fileSizeBytes: bytes,
+      status: "queued", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+    await saveReadyJob(job);
+    const taskName = await enqueueReadySheetTask({ jobId, projectId, objectPath: path });
+    res.status(202).json({ ok: true, jobId, projectId, status: "queued", taskName,
+      statusUrl: `${PUBLIC_BASE_URL}/ready-sheets/jobs/${jobId}?projectId=${projectId}` });
+  } catch (error) {
+    if (job) await saveReadyJob({ ...job, status: "failed", error: error?.message || String(error),
+      updatedAt: new Date().toISOString() }).catch(() => {});
+    console.error("ready-sheets/jobs:", error);
+    res.status(error?.status || 500).json({ ok: false, error: error?.message || String(error) });
+  }
+});
+
+app.get("/ready-sheets/jobs/:jobId", async (req, res) => {
+  try {
+    const job = await getReadyJob(String(req.query.projectId || ""), req.params.jobId);
+    if (!job) return res.status(404).json({ ok: false, error: "Trabajo no encontrado." });
+    const previewUrl = job.status === "completed" && job.previewPath
+      ? await signedReadUrl(job.previewPath) : null;
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ ok: true, ...job, previewUrl });
+  } catch (error) {
+    res.status(400).json({ ok: false, error: error?.message || String(error) });
+  }
+});
+
+app.post("/ready-sheets/worker", async (req, res) => {
+  const bodyText = JSON.stringify(req.body || {});
+  if (!verifyTaskSignature(bodyText, req.get("X-BixStudio-Task-Signature"))) {
+    return res.status(403).json({ ok: false, error: "Firma de tarea inválida." });
+  }
+  const { projectId, jobId, objectPath } = req.body || {};
+  let workDir = null;
+  try {
+    const current = await getReadyJob(projectId, jobId);
+    if (!current || current.originalPath !== objectPath) {
+      return res.status(404).json({ ok: false, error: "Trabajo no encontrado." });
+    }
+    if (current.status === "completed") return res.json({ ok: true, jobId, status: "completed" });
+    const { source, bytes } = await validateReadySource(projectId, objectPath);
+    await saveReadyJob({ ...current, status: "processing", error: null, updatedAt: new Date().toISOString() });
+
+    // Cloud Run writable storage consumes instance memory unless an ephemeral
+    // disk is configured. Keep the feature disabled until staging is sized.
+    workDir = await mkdtemp(join(tmpdir(), "bix-ready-sheet-"));
+    const localPath = join(workDir, "original");
+    await pipeline(source.createReadStream(), createWriteStream(localPath));
+    const analysis = await analyzeReadySheetFile(localPath);
+    const preview = await makeReadySheetPreview(localPath);
+    const previewPath = `projects/${projectId}/ready-previews/${jobId}.png`;
+    await bucket.file(previewPath).save(preview, { resumable: false,
+      contentType: "image/png", metadata: { cacheControl: "private, max-age=0, no-store" } });
+    await saveReadyJob({ ...current, status: "completed", fileSizeBytes: bytes,
+      analysis, previewPath, error: null, updatedAt: new Date().toISOString() });
+    res.json({ ok: true, jobId, status: "completed" });
+  } catch (error) {
+    console.error("ready-sheets/worker:", error);
+    const current = await getReadyJob(projectId, jobId).catch(() => null);
+    if (current) await saveReadyJob({ ...current, status: "failed",
+      error: String(error?.message || error).slice(0, 500), updatedAt: new Date().toISOString() }).catch(() => {});
+    res.status(error?.status && error.status < 500 ? 200 : 500).json({
+      ok: false, jobId, status: "failed", error: error?.message || String(error)
+    });
+  } finally {
+    if (workDir) await rm(workDir, { recursive: true, force: true }).catch(error => {
+      console.error("ready-sheets/worker cleanup:", error);
     });
   }
 });
