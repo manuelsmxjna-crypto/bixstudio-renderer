@@ -1,11 +1,17 @@
 import express from "express";
 import sharp from "sharp";
 import { Storage } from "@google-cloud/storage";
+import { Firestore } from "@google-cloud/firestore";
 import crypto from "node:crypto";
 import { CloudTasksClient } from "@google-cloud/tasks";
+import { verifyShopifyWebhook, readPaidDrafts, validateSecureSheet } from "./secure-order.js";
 
 const app = express();
 const storage = new Storage();
+const galleryDb = new Firestore();
+
+// Register before express.json: Shopify signs the exact raw bytes.
+app.post("/secure-orders/shopify-paid", express.raw({ type: "application/json", limit: "2mb" }), securePaidWebhook);
 
 app.use(express.json({ limit: "5mb" }));
 
@@ -16,6 +22,7 @@ const BUCKET_NAME =
   process.env.BIXSTUDIO_BUCKET || "bixstudio-files-318403647962";
 
 const bucket = storage.bucket(BUCKET_NAME);
+const secureCheckoutEnabled = process.env.SECURE_GALLERY_CHECKOUT_ENABLED === "true";
 
 const tasksClient = new CloudTasksClient();
 const TASKS_LOCATION = process.env.TASKS_LOCATION || "us-central1";
@@ -146,6 +153,46 @@ async function enqueueRenderTask(payload) {
 
   const [created] = await tasksClient.createTask({ parent, task });
   return created?.name || null;
+}
+
+function secureDraftPath(id) { return `secure-orders/drafts/${id}.json`; }
+function secureEventPath(id) { return `secure-orders/events/${id}.json`; }
+
+async function enqueueSecureOrderTask(eventId) {
+  const project = process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT;
+  if (!project) throw new Error("GOOGLE_CLOUD_PROJECT no está configurado.");
+  const body = JSON.stringify({ eventId });
+  const [task] = await tasksClient.createTask({
+    parent: tasksClient.queuePath(project, TASKS_LOCATION, TASKS_QUEUE),
+    task: { httpRequest: { httpMethod: "POST", url: `${PUBLIC_BASE_URL}/secure-orders/worker`,
+      headers: { "Content-Type": "application/json", "X-BixStudio-Task-Signature": signTaskBody(body) },
+      body: Buffer.from(body).toString("base64") }, dispatchDeadline: { seconds: 1800 } }
+  });
+  return task?.name;
+}
+
+async function securePaidWebhook(req, res) {
+  if (!secureCheckoutEnabled) return res.sendStatus(503);
+  const secret = process.env.SHOPIFY_WEBHOOK_SECRET;
+  if (!verifyShopifyWebhook(req.body, req.get("X-Shopify-Hmac-Sha256"), secret)) return res.sendStatus(401);
+  if (req.get("X-Shopify-Topic") !== "orders/paid" || req.get("X-Shopify-Shop-Domain") !== process.env.SHOPIFY_SHOP_DOMAIN) return res.sendStatus(403);
+  const eventId = String(req.get("X-Shopify-Webhook-Id") || "");
+  if (!isUuid(eventId)) return res.status(400).json({ ok: false, error: "ID de evento inválido." });
+  try {
+    const order = JSON.parse(req.body.toString("utf8"));
+    const lines = readPaidDrafts(order, process.env.SHOPIFY_DTF_VARIANT_ID);
+    if (!lines.length) return res.sendStatus(200);
+    const file = bucket.file(secureEventPath(eventId));
+    try { await file.save(JSON.stringify({ orderId: String(order.id), lines }), {
+      contentType: "application/json", preconditionOpts: { ifGenerationMatch: 0 }
+    }); } catch (error) { if (error.code !== 412) throw error; }
+    try { await enqueueSecureOrderTask(eventId); }
+    catch (error) { await file.delete({ ignoreNotFound: true }); throw error; }
+    return res.sendStatus(202);
+  } catch (error) {
+    console.error("secure paid webhook:", error);
+    return res.status(500).json({ ok: false, error: "No se pudo aceptar el evento de pago." });
+  }
 }
 
 async function getRenderJob(jobId) {
@@ -1066,6 +1113,91 @@ app.post("/download-url", async (req, res) => {
   }
 });
 
+
+app.post("/secure-orders/drafts", async (req, res) => {
+  if (!secureCheckoutEnabled) return res.status(503).json({ ok: false, error: "El flujo seguro está desactivado." });
+  try {
+    const projectId = String(req.body?.projectId || "");
+    const sheet = req.body?.sheet || {};
+    const objects = req.body?.objects;
+    const billableCm = validateSecureSheet(sheet, objects, projectId);
+    const draftId = crypto.randomUUID();
+    await bucket.file(secureDraftPath(draftId)).save(JSON.stringify({ draftId, projectId, sheet, objects, billableCm, createdAt: Date.now() }), {
+      contentType: "application/json", preconditionOpts: { ifGenerationMatch: 0 }
+    });
+    return res.status(201).json({ ok: true, draftId, billableCm });
+  } catch (error) { return res.status(400).json({ ok: false, error: error.message }); }
+});
+
+app.post("/secure-orders/worker", async (req, res) => {
+  if (!secureCheckoutEnabled) return res.sendStatus(503);
+  const body = JSON.stringify(req.body || {});
+  if (!verifyTaskSignature(body, req.get("X-BixStudio-Task-Signature"))) return res.sendStatus(403);
+  const eventId = String(req.body?.eventId || "");
+  if (!isUuid(eventId)) return res.sendStatus(400);
+  let claim;
+  try {
+    const [eventBuffer] = await bucket.file(secureEventPath(eventId)).download();
+    const event = JSON.parse(eventBuffer.toString("utf8"));
+    const orderId = String(event.orderId);
+    if (!/^\d+$/.test(orderId)) throw new Error("ID de pedido inválido.");
+    claim = galleryDb.collection("secureOrderClaims").doc(orderId);
+    const acquired = await galleryDb.runTransaction(async transaction => {
+      const current = await transaction.get(claim);
+      if (current.exists && current.data().status === "completed") return false;
+      if (current.exists && current.data().leaseUntil > Date.now()) throw new Error("El pedido ya se está procesando.");
+      const priorJobs = current.exists && Array.isArray(current.data().jobs) ? current.data().jobs : [];
+      transaction.set(claim, { status: "processing", leaseUntil: Date.now() + 40 * 60 * 1000, eventId, jobs: priorJobs });
+      return priorJobs;
+    });
+    if (acquired === false) return res.json({ ok: true, duplicate: true });
+    const drafts = [];
+    for (const line of event.lines) {
+      let total = 0;
+      for (const draftId of line.ids) {
+        const [raw] = await bucket.file(secureDraftPath(draftId)).download();
+        const draft = JSON.parse(raw.toString("utf8"));
+        if (draft.draftId !== draftId || Date.now() - draft.createdAt > 30 * 24 * 60 * 60 * 1000) throw new Error("La composición venció o no coincide.");
+        total += validateSecureSheet(draft.sheet, draft.objects, draft.projectId);
+        drafts.push(draft);
+      }
+      if (total !== line.quantity) throw new Error("El largo pagado no coincide con las hojas del pedido.");
+    }
+    const jobs = [...acquired];
+    for (const [index, draft] of drafts.entries()) {
+      if (jobs.some(job => job.draftId === draft.draftId)) continue;
+      const objects = [];
+      for (const object of draft.objects) {
+        if (!object.galleryId) { objects.push(object); continue; }
+        const image = await galleryDb.collection("galleryImages").doc(object.galleryId).get();
+        if (!image.exists || !image.data().published) throw new Error("Un diseño de la galería dejó de estar publicado.");
+        const data = image.data();
+        if (data.categoryId) {
+          const category = await galleryDb.collection("galleryCategories").doc(data.categoryId).get();
+          if (!category.exists || !category.data().published) throw new Error("La categoría dejó de estar publicada.");
+        }
+        if (!/^gallery\/originals\/[A-Za-z0-9_.-]+$/.test(data.objectPath || "")) throw new Error("Ruta de galería inválida.");
+        const destination = `projects/${draft.projectId}/assets/originals/secure-${crypto.randomUUID()}`;
+        await bucket.file(data.objectPath).copy(bucket.file(destination));
+        objects.push({ ...object, storagePath: destination, galleryId: undefined });
+      }
+      const sheetNumber = Number(draft.sheet.sheetNumber) || index + 1;
+      const sheet = { ...draft.sheet, sheetNumber, name: `Order_${orderId}_${draft.draftId}_${draft.sheet.name || "Sheet"}` };
+      const sheetRow = await ensureSheetRecord({ projectId: draft.projectId, sheetNumber, widthCm: sheet.widthCm, heightCm: sheet.heightCm, layout: objects });
+      const renderJob = await createRenderJob(draft.projectId, sheetRow.id);
+      await enqueueRenderTask({ renderJobId: renderJob.id, projectId: draft.projectId, sheetId: sheetRow.id, sheet, objects });
+      jobs.push({ draftId: draft.draftId, renderJobId: renderJob.id });
+      await claim.set({ jobs }, { merge: true });
+    }
+    await bucket.file(`secure-orders/receipts/${orderId}.json`).save(JSON.stringify({ orderId, jobs, eventId, createdAt: Date.now() }), { contentType: "application/json" });
+    await claim.set({ status: "completed", leaseUntil: 0, eventId, jobs });
+    return res.json({ ok: true, orderId, jobs: jobs.length });
+  } catch (error) {
+    console.error("secure order worker:", error);
+    if (claim) await claim.set({ status: "failed", leaseUntil: 0, error: String(error.message).slice(0, 500) }, { merge: true }).catch(console.error);
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
 
 app.post("/render-queue", async (req, res) => {
   try {
