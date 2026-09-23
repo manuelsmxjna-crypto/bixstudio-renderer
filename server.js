@@ -31,9 +31,27 @@ const PUBLIC_BASE_URL = (
   process.env.BIX_RENDERER_PUBLIC_URL ||
   "https://bixstudio-renderer-318403647962.us-central1.run.app"
 ).replace(/\/$/, "");
+const SECURE_TASK_SERVICE_ACCOUNT = process.env.SECURE_ORDER_TASK_SERVICE_ACCOUNT || "";
 
 const SUPABASE_URL = String(process.env.SUPABASE_URL || "").replace(/\/$/, "");
 const SUPABASE_SECRET_KEY = String(process.env.SUPABASE_SECRET_KEY || "");
+
+if (secureCheckoutEnabled && (!process.env.BIX_RENDERER_PUBLIC_URL || !SECURE_TASK_SERVICE_ACCOUNT || !SUPABASE_URL || !SUPABASE_SECRET_KEY)) {
+  throw new Error("El flujo seguro requiere BIX_RENDERER_PUBLIC_URL, SECURE_ORDER_TASK_SERVICE_ACCOUNT y la configuración de Supabase.");
+}
+
+function workerHttpRequest(path, bodyText) {
+  const request = {
+    httpMethod: "POST",
+    url: `${PUBLIC_BASE_URL}${path}`,
+    headers: { "Content-Type": "application/json", "X-BixStudio-Task-Signature": signTaskBody(bodyText) },
+    body: Buffer.from(bodyText).toString("base64")
+  };
+  if (SECURE_TASK_SERVICE_ACCOUNT) {
+    request.oidcToken = { serviceAccountEmail: SECURE_TASK_SERVICE_ACCOUNT, audience: PUBLIC_BASE_URL };
+  }
+  return request;
+}
 
 function getSupabaseRestRoot() {
   if (!SUPABASE_URL) throw new Error("Falta SUPABASE_URL");
@@ -134,18 +152,9 @@ async function enqueueRenderTask(payload) {
   );
 
   const bodyText = JSON.stringify(payload);
-  const signature = signTaskBody(bodyText);
 
   const task = {
-    httpRequest: {
-      httpMethod: "POST",
-      url: `${PUBLIC_BASE_URL}/render-worker`,
-      headers: {
-        "Content-Type": "application/json",
-        "X-BixStudio-Task-Signature": signature
-      },
-      body: Buffer.from(bodyText).toString("base64")
-    },
+    httpRequest: workerHttpRequest("/render-worker", bodyText),
     dispatchDeadline: {
       seconds: 1800
     }
@@ -164,9 +173,7 @@ async function enqueueSecureOrderTask(eventId) {
   const body = JSON.stringify({ eventId });
   const [task] = await tasksClient.createTask({
     parent: tasksClient.queuePath(project, TASKS_LOCATION, TASKS_QUEUE),
-    task: { httpRequest: { httpMethod: "POST", url: `${PUBLIC_BASE_URL}/secure-orders/worker`,
-      headers: { "Content-Type": "application/json", "X-BixStudio-Task-Signature": signTaskBody(body) },
-      body: Buffer.from(body).toString("base64") }, dispatchDeadline: { seconds: 1800 } }
+    task: { httpRequest: workerHttpRequest("/secure-orders/worker", body), dispatchDeadline: { seconds: 1800 } }
   });
   return task?.name;
 }
