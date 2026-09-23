@@ -50,7 +50,7 @@ test("HTTP queue renders the clean source privately and public retrieval routes 
    const reference=await vm.runInContext("renderSheetToStorage(referenceInput)",context);
    assert.deepEqual(await sharp(privatePng).raw().toBuffer(),await sharp(files.get(reference.outputPath)).raw().toBuffer());
    assert.equal((await fetch(base+`/print-file/${jobId}`,{redirect:"manual"})).status,403);
-   const status=await (await fetch(base+`/render-job/${jobId}`)).json();assert.equal(status.outputPath,null);
+   const status=await (await fetch(base+`/render-job/${jobId}`)).json();assert.equal(status.outputPath,null);assert.equal(status.printFileUrl,`https://admin.example/production/${jobId}`);
    assert.notEqual((await post("/download-url",{objectPath:receipt.outputPath})).status,200);
    assert.notEqual((await post("/download-url",{objectPath:originalPath})).status,200);
    assert.notEqual((await post("/render-queue",{projectId:jobId,sheet,objects:[{...geometry,storagePath:receipt.outputPath}]})).status,202);

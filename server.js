@@ -1266,17 +1266,20 @@ app.get("/render-job/:id", async (req, res) => {
       });
     }
 
+    const privateGalleryOutput = isPrivateGalleryPath(job.output_path);
     res.json({
       ok: true,
       renderJobId: job.id,
       status: job.status,
       attempts: job.attempts,
-      outputPath: isPrivateGalleryPath(job.output_path) ? null : job.output_path,
+      outputPath: privateGalleryOutput ? null : job.output_path,
       error: job.error_message,
       createdAt: job.created_at,
       startedAt: job.started_at,
       finishedAt: job.finished_at,
-      printFileUrl: `${PUBLIC_BASE_URL}/print-file/${job.id}`
+      printFileUrl: privateGalleryOutput
+        ? `${galleryAdminUrl}/production/${job.id}`
+        : `${PUBLIC_BASE_URL}/print-file/${job.id}`
     });
   } catch (error) {
     res.status(400).json({
