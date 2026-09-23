@@ -7,12 +7,13 @@ const otherProjectId = "208dad8b-c3cf-40e1-9b61-503d7f511c94";
 const origin = "https://bixstudio-builder.pages.dev";
 const secret = "a-private-test-secret-with-at-least-32-characters";
 
-async function withGateway(run) {
+async function withGateway(run, options = {}) {
   const forwarded = [];
   const app = createGateway({
     rendererUrl: "https://bixstudio-renderer-test-318403647962.us-central1.run.app",
     tokenSecret: secret,
     allowedOrigins: origin,
+    ...options,
     getIdToken: async () => "google-id-token",
     forwardFetch: async (url, options) => {
       forwarded.push({ url, options });
@@ -28,13 +29,14 @@ async function withGateway(run) {
   }
 }
 
-function post(url, path, body, token, requestOrigin = origin) {
+function post(url, path, body, token, requestOrigin = origin, turnstileToken) {
   return fetch(`${url}${path}`, {
     method: "POST",
     headers: {
       Origin: requestOrigin,
       "Content-Type": "application/json",
-      ...(token ? { "X-BixStudio-Project-Token": token } : {})
+      ...(token ? { "X-BixStudio-Project-Token": token } : {}),
+      ...(turnstileToken ? { "X-BixStudio-Turnstile-Token": turnstileToken } : {})
     },
     body: JSON.stringify(body)
   });
@@ -46,6 +48,24 @@ test("project token is scoped to one project and expires", () => {
   assert.equal(verifyProjectToken(token, otherProjectId, secret, 1000), false);
   assert.equal(verifyProjectToken(token, projectId, secret, 31 * 24 * 60 * 60 * 1000), false);
   assert.equal(verifyProjectToken(`${token}x`, projectId, secret, 1000), false);
+});
+
+test("Turnstile is required before creating a project and checks hostname and action", async () => {
+  const requests = [];
+  await withGateway(async (url, forwarded) => {
+    assert.equal((await post(url, "/projects", {})).status, 403);
+    assert.equal((await post(url, "/projects", {}, null, origin, "wrong")).status, 403);
+    assert.equal((await post(url, "/projects", {}, null, origin, "valid")).status, 200);
+    assert.equal(forwarded.length, 1);
+    assert.equal(requests.length, 2);
+  }, {
+    turnstileSecret: "server-side-secret",
+    turnstileHostname: "bixstudio-builder.pages.dev",
+    turnstileFetch: async (_url, options) => {
+      requests.push(options.body.get("response"));
+      return Response.json({ success: true, hostname: "bixstudio-builder.pages.dev", action: options.body.get("response") === "valid" ? "create_project" : "wrong_action" });
+    }
+  });
 });
 
 test("only approved origin and paths reach the private renderer", async () => {

@@ -6,6 +6,18 @@ import { pathToFileURL } from "node:url";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const TOKEN_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
 const ROUTES = ["/projects", "/upload-urls", "/assets-confirm", "/download-url", "/secure-orders/drafts"];
+const TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+
+export async function verifyTurnstileToken(token, secret, hostname, verifyFetch = fetch) {
+  if (typeof token !== "string" || !token || token.length > 2048) return false;
+  const body = new URLSearchParams({ secret, response: token });
+  const response = await verifyFetch(TURNSTILE_VERIFY_URL, {
+    method: "POST", body, signal: AbortSignal.timeout(10000)
+  });
+  if (!response.ok) throw new Error("Turnstile no respondió correctamente.");
+  const result = await response.json();
+  return result.success === true && result.hostname === hostname && result.action === "create_project";
+}
 
 function privateRendererOrigin(value) {
   const url = new URL(value || "https://invalid.example");
@@ -53,7 +65,7 @@ export function verifyProjectToken(token, projectId, secret, now = Date.now()) {
   } catch { return false; }
 }
 
-export function createGateway({ rendererUrl, tokenSecret, allowedOrigins, getIdToken, forwardFetch = fetch, now = Date.now }) {
+export function createGateway({ rendererUrl, tokenSecret, allowedOrigins, getIdToken, forwardFetch = fetch, now = Date.now, turnstileSecret, turnstileHostname, turnstileFetch = fetch }) {
   const audience = privateRendererOrigin(rendererUrl);
   if (!tokenSecret || tokenSecret.length < 32) throw new Error("BUILDER_GATEWAY_SECRET debe tener al menos 32 caracteres.");
   const origins = new Set(String(allowedOrigins || "").split(",").map(x => x.trim()).filter(Boolean));
@@ -64,6 +76,9 @@ export function createGateway({ rendererUrl, tokenSecret, allowedOrigins, getIdT
     } catch { return true; }
   })) throw new Error("BUILDER_ALLOWED_ORIGINS debe contener orígenes HTTPS exactos.");
   if (typeof getIdToken !== "function") throw new Error("Falta el proveedor de identidad.");
+  if (turnstileSecret && (!turnstileHostname || !origins.has(`https://${turnstileHostname}`))) {
+    throw new Error("TURNSTILE_HOSTNAME debe coincidir con un origen permitido.");
+  }
 
   const app = express();
   app.disable("x-powered-by");
@@ -73,7 +88,7 @@ export function createGateway({ rendererUrl, tokenSecret, allowedOrigins, getIdT
     if (origin && origins.has(origin)) {
       res.set("Access-Control-Allow-Origin", origin);
       res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
-      res.set("Access-Control-Allow-Headers", "Content-Type, X-BixStudio-Project-Token");
+      res.set("Access-Control-Allow-Headers", "Content-Type, X-BixStudio-Project-Token, X-BixStudio-Turnstile-Token");
       res.set("Access-Control-Max-Age", "3600");
     }
     if (req.method === "OPTIONS") return res.sendStatus(origin && origins.has(origin) ? 204 : 403);
@@ -90,6 +105,15 @@ export function createGateway({ rendererUrl, tokenSecret, allowedOrigins, getIdT
     if (route !== "/projects" && !projectId) return res.status(400).json({ ok: false, error: "Proyecto o ruta inválidos." });
     if (projectId && !verifyProjectToken(req.get("X-BixStudio-Project-Token"), projectId, tokenSecret, now())) {
       return res.status(403).json({ ok: false, error: "Token de proyecto inválido o vencido." });
+    }
+    if (route === "/projects" && turnstileSecret) {
+      try {
+        const valid = await verifyTurnstileToken(req.get("X-BixStudio-Turnstile-Token"), turnstileSecret, turnstileHostname, turnstileFetch);
+        if (!valid) return res.status(403).json({ ok: false, error: "Verificación de seguridad inválida o vencida." });
+      } catch (error) {
+        console.error("Turnstile verification failed:", error.message);
+        return res.status(503).json({ ok: false, error: "No se pudo verificar el acceso." });
+      }
     }
     try {
       const token = await getIdToken(audience);
@@ -116,11 +140,16 @@ export function createGateway({ rendererUrl, tokenSecret, allowedOrigins, getIdT
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  if (process.env.BUILDER_REQUIRE_TURNSTILE === "true" && (!process.env.BUILDER_TURNSTILE_SECRET || !process.env.BUILDER_TURNSTILE_HOSTNAME)) {
+    throw new Error("El gateway público requiere BUILDER_TURNSTILE_SECRET y BUILDER_TURNSTILE_HOSTNAME.");
+  }
   const auth = new GoogleAuth();
   const app = createGateway({
     rendererUrl: process.env.PRIVATE_RENDERER_URL,
     tokenSecret: process.env.BUILDER_GATEWAY_SECRET,
     allowedOrigins: process.env.BUILDER_ALLOWED_ORIGINS,
+    turnstileSecret: process.env.BUILDER_TURNSTILE_SECRET,
+    turnstileHostname: process.env.BUILDER_TURNSTILE_HOSTNAME,
     getIdToken: async audience => {
       const client = await auth.getIdTokenClient(audience);
       return client.idTokenProvider.fetchIdToken(audience);

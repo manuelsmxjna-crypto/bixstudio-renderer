@@ -26,6 +26,16 @@ ejemplo Cloud Armor y cuotas), comprobar el límite real de las políticas POST 
 verificar el CORS del bucket para el origen del iframe. El gateway no debe tener
 acceso directo a Storage, Supabase ni Firestore; su cuenta solo invoca al renderer.
 
+Para la prueba pública, crear un widget Turnstile dedicado al hostname
+`bixstudio-builder.pages.dev`. Configurar `BUILDER_REQUIRE_TURNSTILE=true`,
+`BUILDER_TURNSTILE_HOSTNAME=bixstudio-builder.pages.dev` y
+`BUILDER_TURNSTILE_SECRET` desde Secret Manager. El builder envía el token en
+`X-BixStudio-Turnstile-Token` al crear proyecto; el gateway valida el token,
+hostname y acción `create_project` antes de llamar al renderer. La site key
+pública va en `BIX_TURNSTILE_SITE_KEY` del builder; nunca poner la secret key
+en HTML. Turnstile no limita las subidas repetidas dentro de un proyecto, por
+lo que siguen haciendo falta límites de consumo antes de abrir el gateway.
+
 Para producción, usar un renderer privado nuevo y mantener el renderer legado
 durante la transición de sesiones antiguas. El modo seguro del renderer rechaza
 los endpoints de render inmediato; no activar ese modo en el servicio legado que
