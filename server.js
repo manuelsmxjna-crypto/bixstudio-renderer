@@ -30,6 +30,9 @@ const PUBLIC_BASE_URL = (
   process.env.BIX_RENDERER_PUBLIC_URL ||
   "https://bixstudio-renderer-318403647962.us-central1.run.app"
 ).replace(/\/$/, "");
+const RENDER_TASK_SERVICE_ACCOUNT =
+  process.env.RENDER_TASK_SERVICE_ACCOUNT ||
+  process.env.READY_SHEET_TASK_SERVICE_ACCOUNT || "";
 
 const SUPABASE_URL = String(process.env.SUPABASE_URL || "").replace(/\/$/, "");
 const SUPABASE_SECRET_KEY = String(process.env.SUPABASE_SECRET_KEY || "");
@@ -149,6 +152,13 @@ async function enqueueRenderTask(payload) {
       seconds: 1800
     }
   };
+
+  if (RENDER_TASK_SERVICE_ACCOUNT) {
+    task.httpRequest.oidcToken = {
+      serviceAccountEmail: RENDER_TASK_SERVICE_ACCOUNT,
+      audience: PUBLIC_BASE_URL
+    };
+  }
 
   const [created] = await tasksClient.createTask({ parent, task });
   return created?.name || null;
