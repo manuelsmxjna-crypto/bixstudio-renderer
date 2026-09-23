@@ -5,6 +5,7 @@ import { Firestore } from "@google-cloud/firestore";
 import crypto from "node:crypto";
 import { CloudTasksClient } from "@google-cloud/tasks";
 import { verifyShopifyWebhook, readPaidDrafts, validateSecureSheet } from "./secure-order.js";
+import { validSecureUploadSizes, signedSecureUploadTarget } from "./secure-upload.js";
 
 const app = express();
 const storage = new Storage();
@@ -762,6 +763,13 @@ app.post("/upload-urls", async (req, res) => {
       });
     }
 
+    if (secureCheckoutEnabled && !validSecureUploadSizes(items)) {
+      return res.status(413).json({
+        ok: false,
+        error: "Cada archivo debe indicar un tamaño de hasta 100 MiB."
+      });
+    }
+
     const prepared = items.map((item, index) => {
       const originalName = safeFilePart(item?.filename || `asset_${index + 1}.png`);
       const contentType = normalizeContentType(item?.contentType);
@@ -789,17 +797,20 @@ app.post("/upload-urls", async (req, res) => {
       };
     });
 
-    const expiresAt = Date.now() + 30 * 60 * 1000;
+    const expiresAt = Date.now() + (secureCheckoutEnabled ? 10 : 30) * 60 * 1000;
 
-    const uploadUrls = await Promise.all(
+    const uploadTargets = await Promise.all(
       prepared.map(async item => {
+        if (secureCheckoutEnabled) {
+          return signedSecureUploadTarget(bucket.file(item.objectPath), item.contentType, expiresAt);
+        }
         const [uploadUrl] = await bucket.file(item.objectPath).getSignedUrl({
           version: "v4",
           action: "write",
           expires: expiresAt,
           contentType: item.contentType
         });
-        return uploadUrl;
+        return { uploadUrl };
       })
     );
 
@@ -832,7 +843,7 @@ app.post("/upload-urls", async (req, res) => {
         objectPath: item.objectPath,
         storagePath: item.objectPath,
         contentType: item.contentType,
-        uploadUrl: uploadUrls[index]
+        ...uploadTargets[index]
       }))
     });
   } catch (error) {
