@@ -8,7 +8,9 @@ import { verifyShopifyWebhook, readPaidDrafts, validateSecureSheet } from "./sec
 
 const app = express();
 const storage = new Storage();
-const galleryDb = new Firestore();
+const galleryDb = new Firestore({
+  databaseId: process.env.FIRESTORE_DATABASE_ID || "(default)"
+});
 
 // Register before express.json: Shopify signs the exact raw bytes.
 app.post("/secure-orders/shopify-paid", express.raw({ type: "application/json", limit: "2mb" }), securePaidWebhook);
