@@ -1099,7 +1099,14 @@ app.post("/render-queue", async (req, res) => {
     const hasGallery = submittedObjects.some(o => o.galleryId);
     if (hasGallery && !galleryWatermarkEnabled) return res.status(503).json({ ok: false, error: "Producción de galería no habilitada." });
     if (!hasGallery) for (const object of submittedObjects) validateObjectPath(object.storagePath);
-    const objects = hasGallery ? await resolveGalleryObjects(submittedObjects, galleryDb) : submittedObjects;
+    let objects = submittedObjects;
+    if (hasGallery) {
+      try {
+        objects = await resolveGalleryObjects(submittedObjects, galleryDb);
+      } catch (error) {
+        throw new Error(`Firestore de galería: ${error?.message || error}`);
+      }
+    }
     const sheetNumber = Math.max(1, Number(sheet.sheetNumber) || 1);
     const widthCm = Number(sheet.widthCm);
     const heightCm = Number(sheet.heightCm);
@@ -1145,7 +1152,13 @@ app.post("/render-queue", async (req, res) => {
 
     let taskName = null;
     try {
-      if (hasGallery) await bucket.file(galleryJobPath(renderJob.id)).save(JSON.stringify({ status: "queued" }), { contentType: "application/json" });
+      if (hasGallery) {
+        try {
+          await bucket.file(galleryJobPath(renderJob.id)).save(JSON.stringify({ status: "queued" }), { contentType: "application/json" });
+        } catch (error) {
+          throw new Error(`Storage privado: ${error?.message || error}`);
+        }
+      }
       taskName = await enqueueRenderTask(taskPayload);
     } catch (queueError) {
       if (hasGallery) await bucket.file(galleryJobPath(renderJob.id)).save(JSON.stringify({ status: "failed" }), { contentType: "application/json" });
@@ -1154,7 +1167,7 @@ app.post("/render-queue", async (req, res) => {
         error_message: `No se pudo encolar: ${queueError?.message || queueError}`,
         finished_at: new Date().toISOString()
       });
-      throw queueError;
+      throw new Error(`Cola de render: ${queueError?.message || queueError}`);
     }
 
     res.status(202).json({
