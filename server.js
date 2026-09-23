@@ -598,8 +598,7 @@ app.get("/supabase-health", async (req, res) => {
     const response = await fetch(getSupabaseRestRoot(), {
       method: "GET",
       headers: {
-        apikey: SUPABASE_SECRET_KEY,
-        Authorization: `Bearer ${SUPABASE_SECRET_KEY}`
+        apikey: SUPABASE_SECRET_KEY
       },
       signal: AbortSignal.timeout(10000)
     });
