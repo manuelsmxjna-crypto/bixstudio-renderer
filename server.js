@@ -1208,6 +1208,7 @@ app.post("/secure-orders/worker", async (req, res) => {
 });
 
 app.post("/render-queue", async (req, res) => {
+  if (secureCheckoutEnabled) return res.status(403).json({ ok: false, error: "El render se habilita después del pago." });
   try {
     const projectId = String(req.body?.projectId || "");
     if (!isUuid(projectId)) {
@@ -1433,6 +1434,7 @@ h1{font-size:22px;margin:0 0 10px}p{color:#64748b;line-height:1.55}.status{displ
 });
 
 app.post("/render-sheet", async (req, res) => {
+  if (secureCheckoutEnabled) return res.status(403).json({ ok: false, error: "El render se habilita después del pago." });
   const started = Date.now();
   let renderJob = null;
 
