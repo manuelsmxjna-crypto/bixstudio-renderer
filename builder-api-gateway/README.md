@@ -35,6 +35,11 @@ hostname y acción `create_project` antes de llamar al renderer. La site key
 pública va en `BIX_TURNSTILE_SITE_KEY` del builder; nunca poner la secret key
 en HTML. Turnstile no limita las subidas repetidas dentro de un proyecto, por
 lo que siguen haciendo falta límites de consumo antes de abrir el gateway.
+El renderer seguro reserva cuotas en transacciones de Firestore: por proyecto,
+hasta 100 archivos/2 GiB de políticas de subida y 100 composiciones. Estas
+cuotas limitan la emisión de nuevas políticas, pero una política POST vigente
+puede reutilizarse; no sustituyen límites de tráfico en el borde ni una prueba
+de costos antes de publicar el gateway.
 
 Para producción, usar un renderer privado nuevo y mantener el renderer legado
 durante la transición de sesiones antiguas. El modo seguro del renderer rechaza

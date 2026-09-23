@@ -6,6 +6,7 @@ import crypto from "node:crypto";
 import { CloudTasksClient } from "@google-cloud/tasks";
 import { verifyShopifyWebhook, readPaidDrafts, validateSecureSheet } from "./secure-order.js";
 import { validSecureUploadSizes, signedSecureUploadTarget } from "./secure-upload.js";
+import { reserveSecureProjectQuota, SecureQuotaError } from "./secure-quota.js";
 
 const app = express();
 const storage = new Storage();
@@ -814,6 +815,13 @@ app.post("/upload-urls", async (req, res) => {
       })
     );
 
+    if (secureCheckoutEnabled) {
+      await reserveSecureProjectQuota(galleryDb, projectId, {
+        files: prepared.length,
+        bytes: prepared.reduce((sum, item) => sum + item.fileSizeBytes, 0)
+      });
+    }
+
     await supabaseRequest("assets", {
       method: "POST",
       prefer: "return=minimal",
@@ -848,7 +856,7 @@ app.post("/upload-urls", async (req, res) => {
     });
   } catch (error) {
     console.error("upload-urls:", error);
-    res.status(error?.status ? 502 : 500).json({
+    res.status(error instanceof SecureQuotaError ? 429 : error?.status ? 502 : 500).json({
       ok: false,
       error: error?.message || String(error),
       supabaseStatus: error?.status || null
@@ -1140,12 +1148,19 @@ app.post("/secure-orders/drafts", async (req, res) => {
     const sheet = req.body?.sheet || {};
     const objects = req.body?.objects;
     const billableCm = validateSecureSheet(sheet, objects, projectId);
+    try {
+      await reserveSecureProjectQuota(galleryDb, projectId, { drafts: 1 });
+    } catch (error) {
+      if (error instanceof SecureQuotaError) throw error;
+      console.error("secure draft quota:", error);
+      return res.status(503).json({ ok: false, error: "No se pudo verificar el límite del proyecto." });
+    }
     const draftId = crypto.randomUUID();
     await bucket.file(secureDraftPath(draftId)).save(JSON.stringify({ draftId, projectId, sheet, objects, billableCm, createdAt: Date.now() }), {
       contentType: "application/json", preconditionOpts: { ifGenerationMatch: 0 }
     });
     return res.status(201).json({ ok: true, draftId, billableCm });
-  } catch (error) { return res.status(400).json({ ok: false, error: error.message }); }
+  } catch (error) { return res.status(error instanceof SecureQuotaError ? 429 : 400).json({ ok: false, error: error.message }); }
 });
 
 app.post("/secure-orders/worker", async (req, res) => {
