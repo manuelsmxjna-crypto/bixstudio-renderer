@@ -1,11 +1,14 @@
 import express from "express";
 import sharp from "sharp";
 import { Storage } from "@google-cloud/storage";
+import { Firestore } from "@google-cloud/firestore";
 import crypto from "node:crypto";
 import { CloudTasksClient } from "@google-cloud/tasks";
+import { assertPublicRenderObjects, resolveGalleryObjects, galleryJobPath, galleryOutputPath, isPrivateGalleryPath } from "./gallery-production.js";
 
 const app = express();
 const storage = new Storage();
+const galleryDb = new Firestore();
 
 app.use(express.json({ limit: "5mb" }));
 
@@ -16,6 +19,9 @@ const BUCKET_NAME =
   process.env.BIXSTUDIO_BUCKET || "bixstudio-files-318403647962";
 
 const bucket = storage.bucket(BUCKET_NAME);
+const galleryWatermarkEnabled = process.env.GALLERY_WATERMARK_ENABLED === "true";
+const galleryAdminUrl = String(process.env.GALLERY_ADMIN_URL || "").replace(/\/$/, "");
+if (galleryWatermarkEnabled && !/^https:\/\/[^/]+$/.test(galleryAdminUrl)) throw new Error("Configura GALLERY_ADMIN_URL para producción privada.");
 
 const tasksClient = new CloudTasksClient();
 const TASKS_LOCATION = process.env.TASKS_LOCATION || "us-central1";
@@ -327,8 +333,9 @@ function normalizeContentType(type) {
   return t;
 }
 
-async function downloadStorageObject(objectPath) {
-  const path = validateObjectPath(objectPath);
+async function downloadStorageObject(objectPath, allowGallery = false) {
+  const path = allowGallery && /^gallery\/originals\/[A-Za-z0-9_.-]+$/.test(objectPath)
+    ? objectPath : validateObjectPath(objectPath);
   const file = bucket.file(path);
   const [exists] = await file.exists();
   if (!exists) throw new Error(`No existe el recurso ${path}`);
@@ -336,8 +343,8 @@ async function downloadStorageObject(objectPath) {
   return buffer;
 }
 
-async function rasterizeObject(o) {
-  const src = await downloadStorageObject(o.storagePath);
+async function rasterizeObject(o, allowGallery = false) {
+  const src = await downloadStorageObject(o.storagePath, allowGallery);
   const targetW = Math.max(1, cmToPx(o.width));
   const targetH = Math.max(1, cmToPx(o.height));
 
@@ -366,7 +373,7 @@ async function rasterizeObject(o) {
   };
 }
 
-async function renderSheetToStorage({ projectId, sheet, objects }) {
+async function renderSheetToStorage({ projectId, sheet, objects, privateGalleryJobId = null }) {
   const widthCm = Number(sheet.widthCm);
   const heightCm = Number(sheet.heightCm);
 
@@ -395,7 +402,7 @@ async function renderSheetToStorage({ projectId, sheet, objects }) {
       throw new Error("Un diseño tiene medidas inválidas.");
     }
 
-    const r = await rasterizeObject(o);
+    const r = await rasterizeObject(o, !!privateGalleryJobId);
     const cx = cmToPx(x + width / 2);
     const cy = cmToPx(y + height / 2);
     const left = Math.round(cx - r.width / 2);
@@ -463,7 +470,7 @@ async function renderSheetToStorage({ projectId, sheet, objects }) {
     `${safeFilePart(sheet.name || `Gang_Sheet_${sheetNumber}`)}` +
     `_${widthCm.toFixed(0)}x${heightCm.toFixed(1)}cm_300dpi.png`;
 
-  const outputPath =
+  const outputPath = privateGalleryJobId ? galleryOutputPath(privateGalleryJobId) :
     `projects/${safeFilePart(projectId)}/renders/` +
     `sheet_${sheetNumber}_${filename}`;
 
@@ -1078,10 +1085,15 @@ app.post("/render-queue", async (req, res) => {
     }
 
     const sheet = req.body?.sheet || {};
-    const objects = Array.isArray(req.body?.objects) ? req.body.objects : [];
+    const submittedObjects = Array.isArray(req.body?.objects) ? req.body.objects : [];
+    const hasGallery = submittedObjects.some(o => o.galleryId);
+    if (hasGallery && !galleryWatermarkEnabled) return res.status(503).json({ ok: false, error: "Producción de galería no habilitada." });
+    if (!hasGallery) for (const object of submittedObjects) validateObjectPath(object.storagePath);
+    const objects = hasGallery ? await resolveGalleryObjects(submittedObjects, galleryDb) : submittedObjects;
     const sheetNumber = Math.max(1, Number(sheet.sheetNumber) || 1);
     const widthCm = Number(sheet.widthCm);
     const heightCm = Number(sheet.heightCm);
+    validateSheet(widthCm, heightCm);
 
     if (!objects.length) {
       return res.status(400).json({
@@ -1109,6 +1121,7 @@ app.post("/render-queue", async (req, res) => {
 
     const taskPayload = {
       renderJobId: renderJob.id,
+      privateGalleryJobId: hasGallery ? renderJob.id : null,
       projectId,
       sheetId: sheetRow.id,
       sheet: {
@@ -1122,8 +1135,10 @@ app.post("/render-queue", async (req, res) => {
 
     let taskName = null;
     try {
+      if (hasGallery) await bucket.file(galleryJobPath(renderJob.id)).save(JSON.stringify({ status: "queued" }), { contentType: "application/json" });
       taskName = await enqueueRenderTask(taskPayload);
     } catch (queueError) {
+      if (hasGallery) await bucket.file(galleryJobPath(renderJob.id)).save(JSON.stringify({ status: "failed" }), { contentType: "application/json" });
       await updateRenderJob(renderJob.id, {
         status: "failed",
         error_message: `No se pudo encolar: ${queueError?.message || queueError}`,
@@ -1139,7 +1154,7 @@ app.post("/render-queue", async (req, res) => {
       sheetId: sheetRow.id,
       renderJobId: renderJob.id,
       taskName,
-      printFileUrl: `${PUBLIC_BASE_URL}/print-file/${renderJob.id}`
+      printFileUrl: hasGallery ? `${galleryAdminUrl}/production/${renderJob.id}` : `${PUBLIC_BASE_URL}/print-file/${renderJob.id}`
     });
   } catch (error) {
     console.error("render-queue:", error);
@@ -1183,8 +1198,11 @@ app.post("/render-worker", async (req, res) => {
     const rendered = await renderSheetToStorage({
       projectId: payload.projectId,
       sheet: payload.sheet,
-      objects: Array.isArray(payload.objects) ? payload.objects : []
+      objects: Array.isArray(payload.objects) ? payload.objects : [],
+      privateGalleryJobId: payload.privateGalleryJobId || null
     });
+
+    if (payload.privateGalleryJobId) await bucket.file(galleryJobPath(payload.privateGalleryJobId)).save(JSON.stringify({ status: "completed", outputPath: rendered.outputPath }), { contentType: "application/json" });
 
     await updateRenderJob(renderJobId, {
       status: "completed",
@@ -1200,6 +1218,7 @@ app.post("/render-worker", async (req, res) => {
     });
   } catch (error) {
     console.error("render-worker:", error);
+    if (payload.privateGalleryJobId) await bucket.file(galleryJobPath(payload.privateGalleryJobId)).save(JSON.stringify({ status: "failed" }), { contentType: "application/json" }).catch(console.error);
     await updateRenderJob(renderJobId, {
       status: "failed",
       error_message: String(error?.message || error).slice(0, 2000),
@@ -1229,7 +1248,7 @@ app.get("/render-job/:id", async (req, res) => {
       renderJobId: job.id,
       status: job.status,
       attempts: job.attempts,
-      outputPath: job.output_path,
+      outputPath: isPrivateGalleryPath(job.output_path) ? null : job.output_path,
       error: job.error_message,
       createdAt: job.created_at,
       startedAt: job.started_at,
@@ -1254,6 +1273,7 @@ app.get("/print-file/:id", async (req, res) => {
     }
 
     if (job.status === "completed" && job.output_path) {
+      if (isPrivateGalleryPath(job.output_path)) return res.status(403).type("html").send('<meta charset="utf-8"><h2>Archivo de producción privado</h2><p>Disponible únicamente desde el panel de BixPrint.</p>');
       const url = await signedReadUrl(job.output_path);
       return res.redirect(302, url);
     }
@@ -1293,6 +1313,7 @@ h1{font-size:22px;margin:0 0 10px}p{color:#64748b;line-height:1.55}.status{displ
 });
 
 app.post("/render-sheet", async (req, res) => {
+  if (req.body?.objects?.some?.(o => o.galleryId)) return res.status(400).json({ ok: false, error: "Usa la cola de producción para diseños de galería." });
   const started = Date.now();
   let renderJob = null;
 
