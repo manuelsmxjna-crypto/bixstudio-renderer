@@ -8,8 +8,9 @@ const revision=crypto.createHash("sha256").update(original).digest("hex").slice(
 const object={galleryId:"abcd1234",galleryRevision:revision,x:2,y:3,width:10,height:15,rotation:90,flipX:true};
 const database=(published=true,category=true)=>({collection:name=>({doc:()=>({get:async()=>({exists:true,data:()=>name==="galleryImages"?{objectPath:original,published,categoryId:"cat"}:{published:category}})})})});
 test("private source is resolved server-side and transforms survive",async()=>{
- const [resolved]=await resolveGalleryObjects([object],database());
+ const [resolved]=await resolveGalleryObjects([{...object,alphaCleanup:true,alphaThreshold:91}],database());
  assert.equal(resolved.storagePath,original);assert.equal(resolved.rotation,90);assert.equal(resolved.flipX,true);assert.equal(resolved.x,2);assert.equal(resolved.galleryId,undefined);
+ assert.equal(resolved.alphaCleanup,true);assert.equal(resolved.alphaThreshold,91);
 });
 test("reject substitution, unpublished categories, stale revisions and raw private paths",async()=>{
  await assert.rejects(resolveGalleryObjects([object],database(false)));

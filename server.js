@@ -5,6 +5,7 @@ import { Firestore } from "@google-cloud/firestore";
 import crypto from "node:crypto";
 import { CloudTasksClient } from "@google-cloud/tasks";
 import { assertPublicRenderObjects, resolveGalleryObjects, galleryJobPath, galleryOutputPath, isPrivateGalleryPath } from "./gallery-production.js";
+import { normalizeAlphaCleanup, thresholdRgbaAlpha } from "./alpha-cleanup.js";
 
 const app = express();
 const storage = new Storage();
@@ -373,7 +374,24 @@ async function rasterizeObject(o, allowGallery = false) {
     });
   }
 
-  const png = await img.png({ compressionLevel: 4 }).toBuffer();
+  const alphaCleanup = normalizeAlphaCleanup(o);
+  let png;
+  if (alphaCleanup.enabled) {
+    // Resize/rotation interpolation can create new semi-transparent edge
+    // pixels even when the source has binary alpha. Normalize the finished
+    // object layer immediately before it is composited onto the sheet.
+    const rendered = await img.ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+    thresholdRgbaAlpha(rendered.data, alphaCleanup.threshold);
+    png = await sharp(rendered.data, {
+      raw: {
+        width: rendered.info.width,
+        height: rendered.info.height,
+        channels: rendered.info.channels
+      }
+    }).png({ compressionLevel: 4 }).toBuffer();
+  } else {
+    png = await img.png({ compressionLevel: 4 }).toBuffer();
+  }
   const meta = await sharp(png).metadata();
 
   return {

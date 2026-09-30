@@ -46,7 +46,12 @@ export async function resolveGalleryObjects(objects, db) {
     }
     // Copy only geometry plus the path resolved by the server.
     output.push({ id: o.id, x: o.x, y: o.y, width: o.width, height: o.height,
-      rotation: o.rotation, flipX: !!o.flipX, flipY: !!o.flipY, storagePath: resolved.get(key) });
+      rotation: o.rotation, flipX: !!o.flipX, flipY: !!o.flipY,
+      alphaCleanup: o.alphaCleanup === true,
+      alphaThreshold: Number.isFinite(Number(o.alphaThreshold))
+        ? Math.max(1, Math.min(254, Math.round(Number(o.alphaThreshold))))
+        : 128,
+      storagePath: resolved.get(key) });
   }
   return output;
 }

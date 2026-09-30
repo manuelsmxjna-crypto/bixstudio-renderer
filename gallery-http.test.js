@@ -7,6 +7,7 @@ import { Writable } from "node:stream";
 import express from "express";
 import sharp from "sharp";
 import * as protection from "./gallery-production.js";
+import * as alphaCleanup from "./alpha-cleanup.js";
 
 // Exercise production route bodies and the real Sharp renderer, with only cloud I/O replaced.
 const source=fs.readFileSync(new URL("./server.js",import.meta.url),"utf8");
@@ -19,7 +20,7 @@ test("HTTP queue renders the clean source privately and public retrieval routes 
  const jobs=new Map();let queued;const jobId="06b8d992-b5d0-4ddd-a9a0-bbfcd4423f98";
  const app=express();app.use(express.json());
  const context=vm.createContext({app,sharp,crypto,Buffer,console,bucket,DPI:300,PX_PER_CM:300/2.54,
-   secureCheckoutEnabled:false,galleryWatermarkEnabled:true,galleryAdminUrl:"https://admin.example",PUBLIC_BASE_URL:"https://renderer.example",...protection,
+   secureCheckoutEnabled:false,galleryWatermarkEnabled:true,galleryAdminUrl:"https://admin.example",PUBLIC_BASE_URL:"https://renderer.example",...protection,...alphaCleanup,
    isUuid:id=>/^[0-9a-f-]{36}$/.test(id),
    galleryDb:{collection:()=>({doc:()=>({get:async()=>({exists:true,data:()=>({published:true,objectPath:originalPath})})})})},
    ensureSheetRecord:async()=>({id:"sheet"}),createRenderJob:async()=>{const j={id:jobId,status:"queued"};jobs.set(jobId,j);return j},
@@ -36,7 +37,8 @@ test("HTTP queue renders the clean source privately and public retrieval routes 
    const revision=crypto.createHash("sha256").update(originalPath).digest("hex").slice(0,24);
    const geometry={x:-.2,y:.1,width:1,height:1.4,rotation:90,flipX:true,flipY:true};
    const sheet={widthCm:2,heightCm:2,sheetNumber:1,name:"test"};
-   const response=await post("/render-queue",{projectId:jobId,sheet,objects:[{...geometry,galleryId:"abcd1234",galleryRevision:revision}]});
+   const cleanup={alphaCleanup:true,alphaThreshold:128};
+   const response=await post("/render-queue",{projectId:jobId,sheet,objects:[{...geometry,...cleanup,galleryId:"abcd1234",galleryRevision:revision}]});
    assert.equal(response.status,202);const payload=await response.json();
    assert.equal(payload.printFileUrl,`https://admin.example/production/${jobId}`);
    assert.equal(queued.objects[0].storagePath,originalPath);assert.equal(queued.privateGalleryJobId,jobId);
@@ -45,8 +47,11 @@ test("HTTP queue renders the clean source privately and public retrieval routes 
    const receipt=JSON.parse(files.get(protection.galleryJobPath(jobId)));
    assert.equal(receipt.status,"completed");
    const privatePng=files.get(receipt.outputPath);assert.ok(privatePng.length>0);
+   const renderedPixels=await sharp(privatePng).ensureAlpha().raw().toBuffer();
+   const renderedAlpha=new Set();for(let i=3;i<renderedPixels.length;i+=4)renderedAlpha.add(renderedPixels[i]);
+   assert.deepEqual([...renderedAlpha].sort((a,b)=>a-b),[0,255]);
    // Same renderer, same transforms, known clean uploaded source: output pixels must match.
-   context.referenceInput={projectId:jobId,sheet,objects:[{...geometry,storagePath:uploadPath}]};
+   context.referenceInput={projectId:jobId,sheet,objects:[{...geometry,...cleanup,storagePath:uploadPath}]};
    const reference=await vm.runInContext("renderSheetToStorage(referenceInput)",context);
    assert.deepEqual(await sharp(privatePng).raw().toBuffer(),await sharp(files.get(reference.outputPath)).raw().toBuffer());
    assert.equal((await fetch(base+`/print-file/${jobId}`,{redirect:"manual"})).status,403);
