@@ -6,12 +6,18 @@ import crypto from "node:crypto";
 import { CloudTasksClient } from "@google-cloud/tasks";
 import { assertPublicRenderObjects, resolveGalleryObjects, galleryJobPath, galleryOutputPath, isPrivateGalleryPath } from "./gallery-production.js";
 import { normalizeAlphaCleanup, thresholdRgbaAlpha } from "./alpha-cleanup.js";
+import { extractOrderRenderLinks, orderLinkPath, productionFilename, verifyShopifyWebhook } from "./order-download.js";
 
 const app = express();
 const storage = new Storage();
 const galleryDb = new Firestore();
 
-app.use(express.json({ limit: "5mb" }));
+app.use(express.json({
+  limit: "5mb",
+  verify(req, _res, buffer) {
+    if (req.originalUrl === "/shopify/webhooks/orders/create") req.rawBody = Buffer.from(buffer);
+  }
+}));
 
 const VERSION = "2.6.0";
 const DPI = 300;
@@ -37,6 +43,17 @@ const RENDER_TASK_SERVICE_ACCOUNT =
 
 const SUPABASE_URL = String(process.env.SUPABASE_URL || "").replace(/\/$/, "");
 const SUPABASE_SECRET_KEY = String(process.env.SUPABASE_SECRET_KEY || "");
+const SHOPIFY_WEBHOOK_SECRET = String(process.env.SHOPIFY_WEBHOOK_SECRET || "");
+
+async function readOrderLink(renderJobId) {
+  try {
+    const [raw] = await bucket.file(orderLinkPath(renderJobId)).download();
+    return JSON.parse(raw.toString("utf8"));
+  } catch (error) {
+    if (error?.code === 404) return null;
+    throw error;
+  }
+}
 
 function getSupabaseRestRoot() {
   if (!SUPABASE_URL) throw new Error("Falta SUPABASE_URL");
@@ -173,16 +190,18 @@ async function getRenderJob(jobId) {
   return Array.isArray(rows) ? rows[0] || null : rows || null;
 }
 
-async function signedReadUrl(objectPath, expiresMs = 60 * 60 * 1000) {
+async function signedReadUrl(objectPath, expiresMs = 60 * 60 * 1000, filename = "") {
   const path = validateObjectPath(objectPath);
   const file = bucket.file(path);
   const [exists] = await file.exists();
   if (!exists) throw new Error("El archivo final todavía no existe.");
-  const [url] = await file.getSignedUrl({
+  const options = {
     version: "v4",
     action: "read",
     expires: Date.now() + expiresMs
-  });
+  };
+  if (filename) options.responseDisposition = `attachment; filename="${filename}"`;
+  const [url] = await file.getSignedUrl(options);
   return url;
 }
 
@@ -598,6 +617,28 @@ app.get("/supabase-health", async (req, res) => {
       databaseReachable: false,
       error: error?.message || String(error)
     });
+  }
+});
+
+app.post("/shopify/webhooks/orders/create", async (req, res) => {
+  if (!SHOPIFY_WEBHOOK_SECRET) return res.status(503).send("Webhook no configurado");
+  if (!verifyShopifyWebhook(req.rawBody, req.get("x-shopify-hmac-sha256"), SHOPIFY_WEBHOOK_SECRET)) {
+    return res.status(401).send("Firma inválida");
+  }
+
+  // Acknowledge only after the small metadata files are durable. Shopify can
+  // safely retry the webhook because each render job always uses the same path.
+  try {
+    const links = extractOrderRenderLinks(req.body);
+    await Promise.all(links.map(link => bucket.file(orderLinkPath(link.renderJobId)).save(
+      JSON.stringify({ ...link, linkedAt: new Date().toISOString() }),
+      { contentType: "application/json", resumable: false,
+        metadata: { cacheControl: "private, max-age=0, no-store" } }
+    )));
+    res.status(200).json({ ok: true, linked: links.length });
+  } catch (error) {
+    console.error("shopify orders/create webhook:", error);
+    res.status(500).send("No se pudo registrar el pedido");
   }
 });
 
@@ -1318,7 +1359,12 @@ app.get("/print-file/:id", async (req, res) => {
 
     if (job.status === "completed" && job.output_path) {
       if (isPrivateGalleryPath(job.output_path)) return res.status(403).type("html").send('<meta charset="utf-8"><h2>Archivo de producción privado</h2><p>Disponible únicamente desde el panel de BixPrint.</p>');
-      const url = await signedReadUrl(job.output_path);
+      const [link, [fileMetadata]] = await Promise.all([
+        readOrderLink(job.id),
+        bucket.file(job.output_path).getMetadata()
+      ]);
+      const filename = link ? productionFilename(link, fileMetadata?.metadata) : "";
+      const url = await signedReadUrl(job.output_path, 60 * 60 * 1000, filename);
       return res.redirect(302, url);
     }
 
